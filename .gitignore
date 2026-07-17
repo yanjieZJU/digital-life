@@ -8,6 +8,9 @@ config/*.bak*
 *.bak
 *.bak.*
 
+# environment
+/digital-life
+
 # === 实例 ===
 # apps/<UUID>/ 是各实例的私有目录（含飞书凭据、人设、运行时数据）。
 # 实例由 scripts/init_instance.py 从 config/templates/ 复制模板生成。

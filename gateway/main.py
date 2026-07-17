@@ -129,7 +129,13 @@ def _check_pid_alive(pid_file: Path) -> bool:
         if existing and existing != os.getpid():
             os.kill(existing, 0)
             return True
-    except (FileNotFoundError, ValueError, ProcessLookupError, PermissionError):
+    except (FileNotFoundError, ValueError):
+        pass
+    except OSError:
+        # Windows 上 os.kill(<已死 pid>, 0) 抛的是普通 OSError（WinError 87/11），
+        # 不是 ProcessLookupError——若不 catch 会直接崩 gateway，且因为崩在
+        # _write_pid 之前，旧 PID 文件不会被清理，形成“残留 PID → 启动即崩”死循环。
+        # 这里统一视为“已死”。
         pass
     return False
 
@@ -141,9 +147,14 @@ def run_master() -> None:
 
     master_pid = _var_run_dir() / "digital-life-master.pid"
     legacy_pid = _var_run_dir() / "digital-life.pid"  # 兼容旧 CLI
-    if _check_pid_alive(master_pid) or _check_pid_alive(legacy_pid):
-        existing = master_pid.read_text().strip() if master_pid.exists() else legacy_pid.read_text().strip()
-        print(f"Master already running: pid={existing}")
+    # 只用 master_pid 判断“是否已有 master 在跑”。不要读 legacy_pid(digital-life.pid)：
+    # 那个文件是 CLI 用 subprocess.Popen.pid 写的，而在 venv 下 Scripts/python.exe 是
+    # 启动器桩（会 re-exec 真解释器），Popen.pid 是桩的 pid、不等于 gateway 的 os.getpid()。
+    # 桩进程在子进程存活期间一直活着，于是 gateway 会把“自己的启动器桩”误认成“另一个
+    # 正在跑的 master”然后立刻退出。CLI 那一侧已经用 digital-life.pid 做了“已运行”判断，
+    # 这里无需重复。legacy_pid 仍然写入（用 gateway 自己的真 pid），供 CLI 的 status/stop 用。
+    if _check_pid_alive(master_pid):
+        print(f"Master already running: pid={master_pid.read_text().strip()}")
         return
     _write_pid(master_pid)
     _write_pid(legacy_pid)

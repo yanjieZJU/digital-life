@@ -27,13 +27,61 @@ DEFAULT_CONFIG = CONFIG_DIR / "default.yaml"
 
 
 def _is_running(pid: int) -> bool:
+    """Return True if `pid` is a live process.
+
+    POSIX 用 os.kill(pid, 0)；Windows 上 os.kill 对已死 PID 抛的是普通 OSError
+    （WinError 87/11 等，不是 ProcessLookupError），而且对"已退出但父进程仍持有
+    句柄"的子进程会误判为存活，所以 Windows 走 OpenProcess + GetExitCodeProcess。
+    """
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        handle = ctypes.windll.kernel32.OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+        )
+        if not handle:
+            return False
+        try:
+            code = wintypes.DWORD()
+            if not ctypes.windll.kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return False
+            return code.value == STILL_ACTIVE
+        finally:
+            ctypes.windll.kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
         return True
+    except OSError:
+        return False
     return True
+
+
+def _terminate_process(pid: int, *, force: bool = False) -> None:
+    """停止进程（POSIX: SIGTERM/SIGKILL + 进程组；Windows: taskkill /T）。
+
+    Windows 没有 os.killpg / signal.SIGKILL，后台无窗口的 python 进程也收不到
+    SIGTERM，所以用 taskkill：先不带 /F（请求关闭），force=True 时用 /F /T 连子进程
+    一起强杀。两个分支互不触及对方的 POSIX/Windows 专属符号。
+    """
+    if os.name == "nt":
+        cmd = ["taskkill", "/PID", str(pid), "/T"]
+        if force:
+            cmd.insert(1, "/F")
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return
+    sig = signal.SIGKILL if force else signal.SIGTERM
+    try:
+        os.killpg(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
 
 
 def _read_pid() -> int | None:
@@ -75,13 +123,7 @@ def _cleanup_instance_pid_files() -> None:
             continue
         # 该 PID 还在跑？kill 它（先 TERM 后 KILL 兜底）
         if _is_running(pid):
-            try:
-                os.killpg(pid, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    os.kill(pid, signal.SIGTERM)
-                except (ProcessLookupError, PermissionError):
-                    pass
+            _terminate_process(pid, force=False)
             killed.append(pid)
         try:
             f.unlink()
@@ -94,16 +136,10 @@ def _cleanup_instance_pid_files() -> None:
             time.sleep(0.2)
         for pid in killed:
             if _is_running(pid):
-                try:
-                    os.killpg(pid, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    try:
-                        os.kill(pid, signal.SIGKILL)
-                    except (ProcessLookupError, PermissionError):
-                        pass
-                    print(f"killed stale instance worker: pid={pid}")
-                else:
-                    print(f"stopped stale instance worker: pid={pid}")
+                _terminate_process(pid, force=True)
+                print(f"killed stale instance worker: pid={pid}")
+            else:
+                print(f"stopped stale instance worker: pid={pid}")
 
 
 def _tail_log(lines: int = 40) -> str:
@@ -156,6 +192,14 @@ def _base_env(api_port: int | None = None, cwd: Path | None = None) -> dict[str,
     for _k in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy",
                "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"):
         env.pop(_k, None)
+    if os.name == "nt":
+        # 中文 Windows 默认 stdio 用 GBK(cp936)，代码里的 ✓/→ 等字符编不进去会抛
+        # UnicodeEncodeError: 'gbk' codec can't encode character。开 UTF-8 模式让
+        # gateway 及其 instance 子进程的 stdout/stderr/文件默认 UTF-8。
+        # PYTHONIOENCODING 优先级最高，显式设 utf-8 可压过继承到的 gbk；PYTHONUTF8
+        # 再兜底 open() 的默认编码。
+        env["PYTHONUTF8"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
     env.update(
         {
             "PYTHONPATH": os.pathsep.join(paths),
@@ -230,20 +274,28 @@ def _start(args: argparse.Namespace) -> int:
         )
     )
 
-    time.sleep(args.health_wait)
-    code = process.poll()
-    if code is not None:
-        _cleanup_pid_files()
-        print(f"digital-life failed to stay running, exit_code={code}")
-        tail = _tail_log()
-        if tail:
-            print(tail)
-        return code or 1
+    # 健康检查窗口：临时忽略 SIGINT。后台守护进程不该被一次 Ctrl+C 打断启动
+    # （取消请用 digital-life stop）。部分交互式终端/杀软环境会在子进程启动瞬间
+    # 向控制台投递 Ctrl 事件，默认 handler 会变成 KeyboardInterrupt 中断这里的
+    # time.sleep，导致“刚 start 就自动 KeyboardInterrupt”。窗口结束再恢复默认 handler。
+    _prev_handler = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        time.sleep(args.health_wait)
+        code = process.poll()
+        if code is not None:
+            _cleanup_pid_files()
+            print(f"digital-life failed to stay running, exit_code={code}")
+            tail = _tail_log()
+            if tail:
+                print(tail)
+            return code or 1
 
-    suffix = f", api_port={api_port}" if api_port is not None else ""
-    print(f"digital-life started: pid={process.pid}{suffix}")
-    print(f"log={LOG_FILE}")
-    return 0
+        suffix = f", api_port={api_port}" if api_port is not None else ""
+        print(f"digital-life started: pid={process.pid}{suffix}")
+        print(f"log={LOG_FILE}")
+        return 0
+    finally:
+        signal.signal(signal.SIGINT, _prev_handler)
 
 
 def _stop(args: argparse.Namespace) -> int:
@@ -261,18 +313,14 @@ def _stop(args: argparse.Namespace) -> int:
         return 0
 
     print(f"stopping digital-life: pid={pid}")
-    try:
-        os.killpg(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        _cleanup_pid_files()
-        _cleanup_instance_pid_files()
-        return 0
-    except PermissionError:
-        os.kill(pid, signal.SIGTERM)
+    _terminate_process(pid, force=False)
 
-    # master 收到 SIGTERM 后会通过 InstanceSupervisor 优雅 stop 所有子进程，
-    # 这可能需要 5-15 秒（每个实例 FeishuAdapter.stop + cron join）
-    deadline = time.time() + args.timeout
+    # master 收到停止信号后会通过 InstanceSupervisor 优雅 stop 所有子进程，
+    # 这可能需要 5-15 秒（每个实例 FeishuAdapter.stop + cron join）。
+    # Windows 上后台无窗口的 python 收不到 graceful taskkill（WM_CLOSE 无窗口可投递），
+    # 等满 timeout 只是白等；给 2s 短 grace 后走强杀。
+    grace = 2.0 if os.name == "nt" else args.timeout
+    deadline = time.time() + grace
     while time.time() < deadline:
         if not _is_running(pid):
             _cleanup_pid_files()
@@ -282,13 +330,9 @@ def _stop(args: argparse.Namespace) -> int:
         time.sleep(0.25)
 
     if args.kill:
-        try:
-            os.killpg(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            os.kill(pid, signal.SIGKILL)
+        _terminate_process(pid, force=True)
         _cleanup_pid_files()
+        _cleanup_instance_pid_files()
         print("digital-life killed after timeout")
         return 0
 
@@ -334,6 +378,12 @@ def _restart(args: argparse.Namespace) -> int:
 
 def _logs(args: argparse.Namespace) -> int:
     if args.follow:
+        if os.name == "nt":
+            # Windows 没有 tail；用 PowerShell 等效的 Get-Content -Wait -Tail
+            return subprocess.call([
+                "powershell", "-NoProfile", "-Command",
+                f"Get-Content -Wait -Tail {int(args.lines)} -Path '{LOG_FILE}'",
+            ])
         return subprocess.call(["tail", "-n", str(args.lines), "-f", str(LOG_FILE)])
     tail = _tail_log(args.lines)
     if tail:
@@ -367,6 +417,14 @@ def _init(args: argparse.Namespace) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    if os.name == "nt":
+        # 中文 Windows 控制台默认 GBK，print("✓ ...") 等会抛 UnicodeEncodeError。
+        # 环境变量对已运行的 CLI 进程无效，这里直接 reconfigure 自身 stdio。
+        for _stream in (sys.stdout, sys.stderr):
+            try:
+                _stream.reconfigure(encoding="utf-8")
+            except Exception:
+                pass
     parser = argparse.ArgumentParser(prog="digital-life")
     subparsers = parser.add_subparsers(dest="command")
 
