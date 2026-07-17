@@ -24,7 +24,7 @@ class AIAgent:
     base_url: str | None = None
     provider: str | None = None
     api_mode: str = "chat_completions"
-    max_iterations: int = 20
+    max_iterations: int = 90
     reasoning_config: Mapping[str, Any] | None = None
     quiet_mode: bool = True
     platform: str = "l4"
@@ -67,6 +67,8 @@ class AIAgent:
         # Mid-session entity recall tracking
         self._last_scanned_msg_count: int = 0
         self._injected_entities: set[str] = set()
+        # 预查的实体列表——由 tool dispatch 并行预查阶段产出，_inject_entity_recall 复用
+        self._prefetched_entities: list[str] | None = None
         self._injected_memory_ids: set[str] = set()
         # Track recall injection message indices so we only keep the LAST round
         self._recall_injection_indices: list[int] = []
@@ -153,8 +155,17 @@ class AIAgent:
         }
         MAX_SENSE_ONLY_ROUNDS = 10
         sense_only_streak = 0
+        max_iters = max(1, int(self.max_iterations or 90))
+        HARD_LIMIT_AFTER_SOFT = 20  # 软提示后还能再跑 20 轮
 
-        for _ in range(max(1, int(self.max_iterations or 1))):
+        # ── 事件驱动动态预算 ──
+        # 每消费一个正常事件（message/group_message/timer/...）→ 重置为 max_iters
+        # budget_soft_warning 是系统事件，不重置预算
+        _event_budget = max_iters
+        _soft_warned = False
+        _hard_budget = 0
+
+        for iteration_idx in range(max_iters + HARD_LIMIT_AFTER_SOFT + 10):
             # Layer 2（拼）：进新一轮 _chat 前，控制历史 assistant 消息的
             # reasoning_content 可见范围——只保留最近 N 轮的推理，更早的摘掉。
             # 这取代了旧的 _reasoning_history 平面 list + inject 拼接方案——
@@ -195,6 +206,61 @@ class AIAgent:
             # ← 已废弃：reasoning_content 现在直接写进 messages 列表的 assistant msg 里，
             #   _strip_old_reasoning 按轮次截断。不再需要 _reasoning_history 平面 list。
             self._write_log(messages)
+
+            # ── 事件驱动预算：检测正常事件消费 → 重置预算 ──
+            consumed_normal = response.get("_consumed_normal", False)
+            if consumed_normal:
+                _event_budget = max_iters
+                _soft_warned = False
+                _hard_budget = 0
+
+            # ── 软提示：预算耗尽时 emit budget_soft_warning ──
+            if not _soft_warned:
+                _event_budget -= 1
+                if _event_budget <= 0:
+                    try:
+                        from domain.lifecycle.events import emit_event
+                        _energy_val = getattr(self, '_last_energy', None) or 50
+                        emit_event(
+                            "budget_soft_warning",
+                            {"energy": _energy_val},
+                            channel="internal:budget",
+                        )
+                    except Exception:
+                        logger.debug("budget_soft_warning emit failed", exc_info=True)
+                    _soft_warned = True
+                    _hard_budget = HARD_LIMIT_AFTER_SOFT
+
+            # ── 硬截断：软提示后硬预算耗尽 ──
+            if _soft_warned:
+                _hard_budget -= 1
+                if _hard_budget <= 0:
+                    final = "本轮因达到最大执行轮次被系统自动截断。未完成的工作会在下次醒来时继续。"
+                    self._append_message(session_id, "assistant", final)
+                    messages.append({"role": "assistant", "content": final})
+                    self._write_log(messages)
+                    logger.info("Hard cutoff: budget exhausted after soft warning (max_iters=%d, hard=%d)", max_iters, HARD_LIMIT_AFTER_SOFT)
+                    try:
+                        from domain.lifecycle.runtime_context import get_current_affair
+                        from domain.lifecycle.affairs.runtime import update_affair, clear_wait_intent
+                        from domain.lifecycle.state_machine import AffairStatus, WaitType
+                        from domain.lifecycle.alarms import set_alarm
+                        from domain.lifecycle import clock as _clock
+                        aid = get_current_affair()
+                        if aid:
+                            update_affair(aid, status=AffairStatus.BLOCKED)
+                            from datetime import timedelta
+                            wake_dt = _clock.beijing_now_dt() + timedelta(minutes=30)
+                            wake_iso = _clock.to_storage_iso(wake_dt)
+                            set_alarm("timer", wake_iso, payload={
+                                "reason": "max_iterations auto-rest",
+                                "mental_context": "达到最大执行轮次自动休息",
+                            })
+                            clear_wait_intent(aid)
+                    except Exception:
+                        logger.debug("hard cutoff rest setup failed", exc_info=True)
+                    return {"final_response": final, "tool_calls": tool_calls_seen, "status": "blocked"}
+
             if not tool_calls:
                 # 中途信号触发"延续 turn"——模型自然结束本轮但事件队列里有新到的
                 # fan_out 消息（跨实例来源），强制再开一轮让模型处理。
@@ -262,6 +328,47 @@ class AIAgent:
                     sense_only_streak = 0  # 重置计数；下一轮如果还是 sense-only → 直接停
 
             session_blocked = False
+
+            # ── 预检查：tool_calls 里有没有 rest？如果有则跳过 memory 预召回 ──
+            _has_rest = any(
+                (call.get("function") or {}).get("name") == "rest"
+                for call in tool_calls
+            )
+
+            # ── 并行：memory 召回预查（与 tool dispatch 同时跑）──
+            # tool 执行（terminal/express_to_human 等）可能耗时数秒。
+            # 在这段时间里并行做 entity_recall 扫描，下轮 _chat 时就有现成结果。
+            # 只有非 rest 场景才做——rest 后没必要召回。
+            _recall_prefetch = None
+            if not _has_rest and len(tool_calls) > 0:
+                import concurrent.futures
+                def _do_recall_prefetch():
+                    try:
+                        self._last_scanned_msg_count = len(messages)  # 标记已扫描位置
+                        new_messages = []  # 空列表——recall 需要 messages 但工具还没 append
+                        # 不执行真实召回——只做 entity 提取 + query（最轻的部分）
+                        # 真实召回留给 _chat 里的 _inject_entity_recall
+                        # 这里只预查"模型 reasoning 里提到哪些实体"
+                        thinking_texts = []
+                        for m in messages[-5:]:
+                            if m.get("role") == "assistant":
+                                rc = m.get("reasoning_content") or m.get("content") or ""
+                                if len(rc.strip()) >= 30:
+                                    thinking_texts.append(rc)
+                        if not thinking_texts:
+                            return None
+                        combined = " ".join(thinking_texts[-2:])[-500:]
+                        try:
+                            from domain.memory.memory.consciousness.entity_index import extract_entities_from_context
+                            entities = extract_entities_from_context(combined)
+                            return entities
+                        except Exception:
+                            return None
+                    except Exception:
+                        return None
+                _recall_prefetch = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+                _prefetch_future = _recall_prefetch.submit(_do_recall_prefetch)
+
             for call in tool_calls:
                 function = call.get("function") or {}
                 name = function.get("name") or ""
@@ -274,6 +381,20 @@ class AIAgent:
                 # rest() returns __l4_block__ — stop the loop immediately
                 if '"__l4_block__": true' in result or '"__l4_block__":true' in result:
                     session_blocked = True
+
+            # 关闭 recall 预查线程池
+            if _recall_prefetch:
+                try:
+                    _prefetched_entities = _prefetch_future.result(timeout=2.0)
+                    # 预查到的实体存在——_inject_entity_recall 下一轮可以直接用
+                    if _prefetched_entities:
+                        self._prefetched_entities = _prefetched_entities
+                except Exception:
+                    pass
+                _recall_prefetch.shutdown(wait=False)
+                # 重置 _last_scanned_msg_count——_chat 里的 _inject_entity_recall
+                # 需要看到完整的 messages（含 tool result），不能从预查时跳过的位置开始
+                self._last_scanned_msg_count = max(0, len(messages) - 10)
             if session_blocked:
                 # rest-boundary 消息保留：rest() 完成后检查内存池里是否有未在本 wake
                 # 注入过的新事件。若有 → 撤销 rest 副作用（回滚 affair → RUNNING、清
@@ -306,11 +427,9 @@ class AIAgent:
                         continue
                 final = content or "已进入休息。"
                 return {"final_response": final, "tool_calls": tool_calls_seen, "status": "blocked"}
-        final = "达到最大迭代次数，已停止本轮执行。"
-        self._append_message(session_id, "assistant", final)
-        messages.append({"role": "assistant", "content": final})
-        self._write_log(messages)
-        return {"final_response": final, "tool_calls": tool_calls_seen, "status": "blocked"}
+        # for 循环结束（理论上走不到这里——硬截断已经 return）
+        logger.warning("run_conversation: loop exhausted unexpectedly (max_iters=%d)", max_iters)
+        return {"final_response": "执行结束。", "tool_calls": tool_calls_seen, "status": "blocked"}
 
     def _strip_old_reasoning(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """摘掉超出 max_rounds 的旧 assistant 消息的 reasoning_content。
@@ -357,7 +476,7 @@ class AIAgent:
         return messages
 
     def _chat(self, messages: list[dict[str, Any]]) -> dict[str, Any]:
-        self._inject_signalled_events(messages)
+        consumed_normal = self._inject_signalled_events(messages)
         self._inject_entity_recall(messages)
         url = self._chat_url()
         headers = {"Content-Type": "application/json"}
@@ -452,7 +571,7 @@ class AIAgent:
                         _msg["reasoning"] = _reasoning
                 except Exception:
                     pass
-                return {"message": _msg, "raw": data}
+                return {"message": _msg, "raw": data, "_consumed_normal": consumed_normal}
             except httpx.HTTPStatusError as e:
                 if e.response.status_code == 429:
                     # 账号级熔断：收到 429 立即 trip（按 api_key 分区，跨实例共享）。
@@ -1499,30 +1618,40 @@ class AIAgent:
 
         Uses peek_signalled_events so the queue is NOT cleared here by default.
         Only message events call consume_signalled_events (which clears the queue).
+
+        Returns bool: True if a "normal" event (message/group_message/non-system) was
+        consumed — used by run_conversation to reset the event-driven round budget.
+        budget_soft_warning is excluded (system event, doesn't reset budget).
         """
         try:
             from domain.lifecycle.session_events import peek_signalled_events
             events = peek_signalled_events()
         except ImportError:
-            return
+            return False
 
         if not events:
-            return
+            return False
 
         new_events = [e for e in events if e.get("event_id") not in self._injected_signal_event_ids]
         if not new_events:
-            return
+            return False
 
         # Split by whether we auto-consume
         auto_consume_events: list[dict] = []
         manual_events: list[dict] = []
+        consumed_normal = False  # 有正常事件（非 budget_soft_warning）被消费
 
         for ev in new_events:
             kind = ev.get("kind", "")
             if kind in ("message", "group_message"):
                 auto_consume_events.append(ev)
+                consumed_normal = True
             else:
                 manual_events.append(ev)
+                # 非 message 事件：budget_soft_warning 是系统事件不重置预算
+                # 其它都算正常事件
+                if kind != "budget_soft_warning":
+                    consumed_normal = True
 
         # Mark all new events as injected (prevent re-injection this session)
         self._injected_signal_event_ids.update(e.get("event_id") for e in new_events)
@@ -1532,6 +1661,8 @@ class AIAgent:
 
         if manual_events:
             self._notify_manual_events(manual_events, messages)
+
+        return consumed_normal
 
     def _consume_human_events(self, events: list[dict], messages: list[dict[str, Any]]) -> None:
         """Show message/group_message content as tool result and auto-consume.
@@ -1683,6 +1814,16 @@ class AIAgent:
             return
 
         entities = extract_entities_from_context(combined)
+
+        # 合并预查结果——dispatch 并行阶段已提前从 reasoning 提取的实体
+        if self._prefetched_entities:
+            seen = set(entities)
+            for e in self._prefetched_entities:
+                if e not in seen:
+                    entities.append(e)
+                    seen.add(e)
+            self._prefetched_entities = None  # 消费后清空
+
         if not entities:
             return
 
@@ -1723,7 +1864,9 @@ class AIAgent:
                     )
                 )
             ]
-            lines = ["[联想命中 — 你正在思考的上下文里提到了你有相关记忆的实体]"]
+            lines = ["[联想命中 — 三路融合]"]
+
+            # ── Route A: entity_index 精确触发（关键词刺激）──
             for mem in memories:
                 mtype = str(mem.get("memory_type", "")).upper()
                 entity = str(mem.get("_matched_entity", ""))
@@ -1732,22 +1875,55 @@ class AIAgent:
                 if len(snippet) > 200:
                     snippet = snippet[:100] + "…" + snippet[-100:]
                 if mtype == "PROFILE":
-                    # profile = 对该实体的提炼理解(profile-first,替代散乱碎片)
-                    lines.append(f"- [{entity} · 概念] {snippet}")
+                    lines.append(f"🎯 [{entity} · 概念] {snippet}")
                 else:
-                    # snippet 只截关键部分(避免长篇日记占满 faketool)
-                    lines.append(f"- [{mtype}]{tag} {snippet}")
-            # 注解:多少实体命中 / 多少 memory 返回
-            lines.append(f"(命中 {len(new_entities)} 实体: "
-                         f"{', '.join(new_entities[:8])}"
-                         + (f" 等{len(new_entities)-8}个" if len(new_entities) > 8 else "")
-                         + f"; 召回 {len(memories)} 条。"
-                           f"如需更多调 recall_entity('实体名'))")
+                    lines.append(f"🎯 [{mtype}]{tag} {snippet}")
+
+            entity_count = len(new_entities)
+
+            # ── Route B: 向量语义召回（情境相似）──
+            # 用 query 上下文做 embedding → cosine 相似度召回
+            # 补偿 Route A 的精确子串匹配盲区（如"止损线"找不到"A+策略"）
+            vec_lines: list[str] = []
+            try:
+                from domain.memory.memory.recall.vector import recall as _vec_recall
+                vec_result = _vec_recall(combined, max_total_chars=400)
+                if vec_result:
+                    # recall 返回拼接文本——拆成段落做关键词去重
+                    vec_paragraphs = [p.strip() for p in vec_result.split("\n") if p.strip()]
+                    # 去掉 Route A 已经返回过的（按 snippet 前 30 字模糊匹配）
+                    existing_snippets = set()
+                    for mem in memories:
+                        existing_snippets.add(str(mem.get("snippet", ""))[:30])
+                    for p in vec_paragraphs[:3]:
+                        if p[:30] not in existing_snippets and len(p) >= 10:
+                            # 标注来源
+                            source_tag = ""
+                            if "digest" in p.lower() or "session" in p.lower():
+                                source_tag = "[经历]"
+                            elif "lesson" in p.lower() or "教训" in p.lower():
+                                source_tag = "[教训]"
+                            elif "rule" in p.lower() or "规则" in p.lower():
+                                source_tag = "[规则]"
+                            else:
+                                source_tag = "[语义]"
+                            lines.append(f"🔍 {source_tag} {p[:200]}")
+                            vec_lines.append(p)
+            except Exception:
+                pass
+
+            # 注解
+            vec_count = len(vec_lines)
+            lines.append(
+                f"(🎯触发: {entity_count} 实体/{len(memories)} 条"
+                + (f" + 🔍语义: {vec_count} 条" if vec_count else "")
+                + "。如需更多调 recall_entity('实体名'))"
+            )
+
             breadcrumb_text = "\n".join(lines)
             assistant_msg, tool_msg = self._sys_tool_call("entity_recall", breadcrumb_text)
             messages.append(assistant_msg)
             messages.append(tool_msg)
-            self._recall_injection_indices = [len(messages) - 2, len(messages) - 1]
             if self.audit_ctx is not None:
                 try:
                     self.audit_ctx.recall("entity_recall", breadcrumb_text)
@@ -1809,12 +1985,19 @@ def _render_signal_message(ev: dict[str, Any]) -> str:
             + f"\n{body_inner}"
         )
 
-    # 3. 信号头 + 自动已读提示。chat_id 已经在 yaml 模板渲染的正文里
+    # 3. 信号头 + 当前时间 + 自动已读提示。chat_id 已经在 yaml 模板渲染的正文里
     # （私聊：「对话：{chat_id}」，群：「群：{chat_name}（{chat_id}）」），
     # 不再额外硬塞「必须 express_to_human(chat_id=xxx)」之类的具体调用方式——
     # 模型看到 chat_id 就知道回哪里，参数细节交给模型按工具 schema 自己决定。
+    try:
+        from domain.lifecycle import clock as _clk_mid
+        _mid_now = _clk_mid.beijing_now_dt().strftime("%Y-%m-%d %H:%M %A")
+    except Exception:
+        _mid_now = ""
+    _now_line = f"\n⏰ 当前时间：{_mid_now}\n" if _mid_now else ""
     return (
         f"[#{eid} · 新消息到达 - 会话中途注入]\n"
+        f"{_now_line}"
         f"{rendered_body}\n"
         f"> 注意：消息已自动标记为已读，稍后回复即可。"
     )
