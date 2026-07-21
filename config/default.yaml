@@ -19,10 +19,10 @@ budget:
 # ── 精力参数（全局行为模型）──
 vitals:
   energy_recovery_per_hour: 100             # 休息时每小时恢复
-  cost_per_ktoken_input: 0.005              # 每 1k input token 消耗精力
-  cost_per_ktoken_output: 0.05              # 每 1k output token 消耗精力
+  cost_per_ktoken_input: 0.02               # 每 1k input token 消耗精力
+  cost_per_ktoken_output: 0.2               # 每 1k output token 消耗精力
   initiative_energy_threshold: 50           # 主动探索的精力阈值
-  initiative_idle_hours: 1.0                # 主动探索的空闲阈值
+  initiative_idle_hours: 2.0                # 主动探索的空闲阈值
 
 # ── 事件 ──
 events:

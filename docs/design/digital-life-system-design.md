@@ -995,23 +995,23 @@ Zero 在群里说了一句"建议今天关注华能蒙电"，Alpha 的飞书连�
 
 **实现**：每次 LLM call 完成，`agent.py` 解析 API 返回的 `usage` 字段，按两个系数折算成精力：
 
-- `ENERGY_PER_KTOKEN_INPUT = 0.005`（每 1k input token 折 0.005 精力）
-- `ENERGY_PER_KTOKEN_OUTPUT = 0.05`（output 比 input 贵 10×，反映 GLM 计价感受）
+- `ENERGY_PER_KTOKEN_INPUT = 0.02`（每 1k input token 折 0.02 精力）
+- `ENERGY_PER_KTOKEN_OUTPUT = 0.2`（output 比 input 贵 10×，反映 GLM 计价感受）
 
 **系数推导（与用户对齐的目标 — 想"提速 10× 减速"的版本）**：
 
 设计目标是把 token 上限直接锚定到精力刻度：
-- 一天满跑 2000 万 token 应该刚好把满力 100 耗光（让"配额爆"和"累到不行"两件事自然对齐）
-- 一天满跑 ≤ 200 万 token 时就扣 ~10 精力（"一天烧一个上限"≈"歇一口气"的尺度感）
+- 一天满跑 500 万 token 应该刚好把满力 100 耗光（让"配额爆"和"累到不行"两件事自然对齐）
+- 一天满跑 ≤ 50 万 token 时就扣 ~10 精力（"一天烧一个上限"≈"歇一口气"的尺度感）
 - 休息一天（无任何 LLM call）自动恢复到 100（满血复活）
 
-由 100 精力 / 20M token = 0.005 精力/1K token 推出 INPUT 系数；OUTPUT 按 INPUT 的 10× 配（GLM 计价里 output 通常就贵几倍，用一个固定的 10× 比例避免模型生成无关内容刷 token）。
+由 100 精力 / 5M token = 0.02 精力/1K token 推出 INPUT 系数；OUTPUT 按 INPUT 的 10× 配（GLM 计价里 output 通常就贵几倍，用一个固定的 10× 比例避免模型生成无关内容刷 token）。
 
 实际数字（一次 wake 注入上下文 ~5 万 input + 100-500 output；其中大部分为静态人格/项目等 prefix-cached 前缀，计费极低、模型并不重读，模型实际新读的内容远小于此，详见第八章「上下文视野」）：
-- 一次普通 LLM call ≈ 扣 0.25 精力
-- 一个 wake 平均 5-10 次 call → 扣 1-3 精力
-- 一小时满跑 200 万 token → 扣 ~10 精力（`ENERGY_RECOVERY_PER_HOUR = 100/24 ≈ 4.17`，净亏 ~6/h）
-- 一天满跑 2000 万 token → 扣 ~146 精力，恢复 +100，净亏 ~46 → 一天满跑就像"做了满满一天工作量"该有的感觉
+- 一次普通 LLM call ≈ 扣 1.0 精力
+- 一个 wake 平均 5-10 次 call → 扣 5-10 精力
+- 一小时满跑 50 万 token → 扣 ~10 精力（`ENERGY_RECOVERY_PER_HOUR = 100/24 ≈ 4.17`，净亏 ~6/h）
+- 一天满跑 500 万 token → 扣 ~146 精力，恢复 +100，净亏 ~46 → 一天满跑就像"做了满满一天工作量"该有的感觉
 
 **两种消耗独立**：LLM 走 token usage；sense/terminal/todo 等工具走固定"动作成本"（0.05-0.3）。一个数字生命可以"想了很久但没干活"（高 token 烧但低动作消耗），或"干了很久苦活但没怎么烧 token"（低 input + 多次工具调用）——两种成本反映不同维度，互不替代。
 

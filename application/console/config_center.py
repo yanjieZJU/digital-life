@@ -135,9 +135,9 @@ FIELDS: tuple[ConfigField, ...] = (
     ),
     ConfigField("DIGITAL_LIFE_TOKEN_HOURLY_LIMIT", "Token 小时上限", "runtime", "env", "number", default=50000000),
     ConfigField("DIGITAL_LIFE_TOKEN_DAILY_LIMIT", "Token 日上限", "runtime", "env", "number", default=50000000),
-    ConfigField("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", "输入 token 精力系数", "runtime", "env", "number", default=0.005),
+    ConfigField("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", "输入 token 精力系数", "runtime", "env", "number", default=0.02),
     ConfigField("DIGITAL_LIFE_ENERGY_PER_KTOKEN_OUTPUT", "输出 token 精力系数", "runtime", "env", "number",
-        default=0.05, description="一天满跑 2000 万 token 耗尽 100 精力。"),
+        default=0.2, description="一天满跑 500 万 token 耗尽 100 精力。"),
     ConfigField("DIGITAL_LIFE_ENERGY_RECOVERY_PER_HOUR", "每小时精力恢复", "runtime", "env", "number",
         default=25.0, description="默认 25 — 4 小时不动从 0 回满血。"),
 
@@ -318,8 +318,8 @@ class ConfigCenterWorkflow:
                 "token_daily_limit": number("DIGITAL_LIFE_TOKEN_DAILY_LIMIT", 50_000_000),
             },
             "energy": {
-                "per_ktoken_input": number("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", 0.005),
-                "per_ktoken_output": number("DIGITAL_LIFE_ENERGY_PER_KTOKEN_OUTPUT", 0.05),
+                "per_ktoken_input": number("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", 0.02),
+                "per_ktoken_output": number("DIGITAL_LIFE_ENERGY_PER_KTOKEN_OUTPUT", 0.2),
             },
             "agent": {
                 "runtime_provider": env.get("DIGITAL_LIFE_RUNTIME_PROVIDER", "l4"),

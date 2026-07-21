@@ -46,26 +46,26 @@ ENERGY_COST_PER_CALL = 0.2          # 每次工具调用/模型访问的"动作�
 # 精力-token 耦合（设计文档 15.4）：LLM call 走真实 token usage 消耗精力，
 # 不再用上面的 ENERGY_COST_PER_CALL。
 #
-# 设计目标（与用户对齐 2026-06-14）：
-#   - 一天满跑 ≤ 2000 万 token → 把满力 100 刚好耗光
-#   - 一小时满跑 ≤ 200 万 token → 大约 1 小时扣 10 精力
+# 设计目标（与用户对齐 2026-07-17 调参）：
+#   - 一天满跑 ≤ 500 万 token → 把满力 100 刚好耗光
+#   - 一小时满跑 ≤ 50 万 token → 大约 1 小时扣 10 精力
 #
-# 推导：20M token / 100 精力 = 200K token/精力 = 0.005 精力/1K token
+# 推导：5M token / 100 精力 = 50K token/精力 = 0.02 精力/1K token
 # output 实际计价比 input 贵，按 10× 比例分配：
-#   - INPUT  = 0.005/k token （便宜，主要承担 prompt context）
-#   - OUTPUT = 0.05/k token  （贵 10×，承担生成）
+#   - INPUT  = 0.02/k token （便宜，主要承担 prompt context）
+#   - OUTPUT = 0.2/k token  （贵 10×，承担生成）
 #
 # 实际场景验算：
-#   - 一次普通 LLM call: 50k input + 100 output ≈ 0.25 + 0.005 = 0.255 精力
-#   - 一个 wake 平均 5-10 次 call → 1-3 精力
-#   - 一小时满跑 1-2M token → 5-10 精力
-#   - 一天满跑 20M token → 100 精力（正好满血耗光）
+#   - 一次普通 LLM call: 50k input + 100 output ≈ 1.0 + 0.02 = 1.02 精力
+#   - 一个 wake 平均 5-10 次 call → 5-10 精力
+#   - 一小时满跑 0.5-1M token → 10-20 精力
+#   - 一天满跑 5M token → 100 精力（正好满血耗光）
 #   - 休息一天（无消耗）→ 恢复 4.17×24 = 100（正好满血复活）
 #
 # 工具调用（sense/terminal/todo 等）仍保持固定"动作成本"0.05-0.3，
 # 不变；和 token usage 是两套独立的成本。
-ENERGY_PER_KTOKEN_INPUT = 0.005
-ENERGY_PER_KTOKEN_OUTPUT = 0.05
+ENERGY_PER_KTOKEN_INPUT = 0.02
+ENERGY_PER_KTOKEN_OUTPUT = 0.2
 
 
 def _resolve_energy_token_constants() -> None:
@@ -94,7 +94,7 @@ _resolve_energy_token_constants()
 
 # 主动探索
 INITIATIVE_ENERGY_THRESHOLD = 50.0  # 精力 > 50 才可以主动探索
-INITIATIVE_IDLE_HOURS = 1.0         # 空闲 > 1 小时触发
+INITIATIVE_IDLE_HOURS = 2.0         # 空闲 > 2 小时触发
 
 
 def _find_segment(energy: float):

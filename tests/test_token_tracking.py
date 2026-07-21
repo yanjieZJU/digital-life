@@ -77,7 +77,7 @@ def test_token_tracker_zero_records_skipped(isolated_runtime):
 
 
 def test_energy_token_coefficient_defaults_and_env_override(isolated_runtime, monkeypatch):
-    """默认:input=0.005, output=0.05（10× 比，output 贵）；env override 后值变化。"""
+    """默认:input=0.02, output=0.2（10× 比，output 贵）；env override 后值变化。"""
     # 清掉可能的 env 干扰
     monkeypatch.delenv("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", raising=False)
     monkeypatch.delenv("DIGITAL_LIFE_ENERGY_PER_KTOKEN_OUTPUT", raising=False)
@@ -85,8 +85,8 @@ def test_energy_token_coefficient_defaults_and_env_override(isolated_runtime, mo
     import domain.vital.simulation.engine as eng
     importlib.reload(eng)
     eng._resolve_energy_token_constants()
-    assert eng.ENERGY_PER_KTOKEN_INPUT == 0.005
-    assert eng.ENERGY_PER_KTOKEN_OUTPUT == 0.05
+    assert eng.ENERGY_PER_KTOKEN_INPUT == 0.02
+    assert eng.ENERGY_PER_KTOKEN_OUTPUT == 0.2
 
     monkeypatch.setenv("DIGITAL_LIFE_ENERGY_PER_KTOKEN_INPUT", "0.15")
     monkeypatch.setenv("DIGITAL_LIFE_ENERGY_PER_KTOKEN_OUTPUT", "0.9")

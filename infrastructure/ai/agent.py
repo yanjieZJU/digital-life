@@ -713,7 +713,7 @@ class AIAgent:
             logger.debug("record token usage failed: %s", exc)
 
         # 精力-token 耦合（设计文档 15.4）：LLM call 按真实 token usage 折算消耗，
-        # 不走固定 ENERGY_COST_PER_CALL。1k input = 0.05 精力；1k output = 0.5 精力。
+        # 不走固定 ENERGY_COST_PER_CALL。1k input = 0.02 精力；1k output = 0.2 精力。
         # 模型自身的工作成本（terminal / sense / todo 等）独立扣，互不影响。
         try:
             from domain.vital.simulation.engine import (
