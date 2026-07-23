@@ -823,6 +823,7 @@ class AIAgent:
             "domain.project.tools",
             "interfaces.tools.terminal_tool",
             "interfaces.tools.code_execution_tool",
+            "interfaces.tools.web_tools",
         ):
             try:
                 __import__(module_name)

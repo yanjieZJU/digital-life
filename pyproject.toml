@@ -43,7 +43,8 @@ digital-life = "interfaces.cli.cli:main"
 
 [tool.setuptools.packages.find]
 include = [
-    "interfaces*",
+    "gateway*",
+	"interfaces*",
     "application*",
     "domain*",
     "infrastructure*",

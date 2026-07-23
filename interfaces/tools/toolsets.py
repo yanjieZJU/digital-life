@@ -79,6 +79,14 @@ TOOLSETS = {
         ],
         "includes": [],
     },
+    "web": {
+        "description": "Digital Life web tools for searching and reading online pages",
+        "tools": [
+            "web_search",
+            "web_fetch",
+        ],
+        "includes": [],
+    },
 }
 
 

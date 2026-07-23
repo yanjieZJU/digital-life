@@ -6,7 +6,7 @@ import uuid
 from datetime import datetime
 
 
-L4_TOOLSETS = ["actions", "senses", "trading"]
+L4_TOOLSETS = ["actions", "senses", "trading", "web"]
 L4_TASK_TOOLSETS = ["actions", "senses", "tasks", "web", "terminal", "trading"]
 
 
