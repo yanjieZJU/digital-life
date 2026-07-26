@@ -246,11 +246,19 @@ def _sliding_chunks(text: str, max_chars: int = 300, overlap: int = 50) -> List[
 # ──────────────────── 索引构建 ────────────────────
 
 def _index_source(db: sqlite.Connection, label: str, cfg: dict) -> int:
-    # 先删除该source的所有旧chunks，避免累积
-    db.execute("DELETE FROM chunks WHERE source=?", (label,))
-    
+    """增量索引一个源文件。
+
+    历史实现开头先 ``DELETE FROM chunks WHERE source=?`` 抹掉全部行，使下面
+    逐 chunk 的 mtime 检查永远 miss → 每次 ensure_indexed 都对整文件全量重
+    embed（花钱、花延迟）。现改为：按 (source, chunk_hash) 逐条比对 mtime，
+    只对"新 hash 或 mtime 更新"的 chunk 重算 embedding；文件内容变更后不再
+    存在的 stale chunk 按 hash 集合清理；文件被删除则清空该 source。
+    """
     fpath = _get_mem_dir() / cfg["path"]
     if not fpath.exists():
+        # 文件已删除——清理该 source 的残留 chunks（保留原"删除即清空"语义）
+        db.execute("DELETE FROM chunks WHERE source=?", (label,))
+        db.commit()
         return 0
     mtime = fpath.stat().st_mtime
     content = fpath.read_text(encoding="utf-8")
@@ -264,21 +272,38 @@ def _index_source(db: sqlite.Connection, label: str, cfg: dict) -> int:
     chunks = _sliding_chunks(tail, max_chars=cfg["max_chars"])
     if not chunks:
         return 0
+
+    # 增量：只重算"新 hash 或 mtime 更新"的 chunk；同时收集仍应保留的 hash 集合。
     new_chunks = []
+    keep_hashes: set[str] = set()
     for chunk in chunks:
         ch = _chunk_hash(label, chunk)
+        keep_hashes.add(ch)
         row = db.execute(
             "SELECT chunk_hash, file_mtime FROM chunks WHERE source=? AND chunk_hash=?",
             (label, ch),
         ).fetchone()
         if not row or row["file_mtime"] < mtime:
             new_chunks.append((ch, chunk, mtime))
+
+    # 清理该 source 下不再存在的 stale chunk（文件内容变动后残留）。
+    existing_rows = db.execute(
+        "SELECT chunk_hash FROM chunks WHERE source=?", (label,)
+    ).fetchall()
+    stale = [r["chunk_hash"] for r in existing_rows if r["chunk_hash"] not in keep_hashes]
+    for h in stale:
+        db.execute(
+            "DELETE FROM chunks WHERE source=? AND chunk_hash=?", (label, h)
+        )
+
     if not new_chunks:
+        db.commit()  # 仍提交 stale 清理
         return 0
     texts = [c[1] for c in new_chunks]
     embeddings = _embed_texts(texts)
     if not embeddings:
         logger.debug("Embedding failed for %s, skipping index", label)
+        db.commit()  # 仍提交 stale 清理
         return 0
     count = 0
     for (ch, text, mt), emb in zip(new_chunks, embeddings):
@@ -460,11 +485,12 @@ def recall(
 
     query_emb = _embed_single(full_query)
     if not query_emb:
-        try:
-            from domain.memory.memory.recall import recall as keyword_recall
-            return keyword_recall(query, extra_context, max_total_chars)
-        except Exception:
-            return ""
+        # embedding 不可用（无 API key / 接口失败）→ 诚实返回空。
+        # 历史上这里降级到关键词召回（TF + 中文 bigram 余弦），但那条路质量很低、
+        # 且 embedding 不可用基本意味着整个向量路已废——降级召回反而可能注入不相关
+        # 记忆误导模型。维持两套召回实现也是冗余。改为静默返回空 + 日志。
+        logger.debug("Embedding unavailable, vector recall skipped (query=%s)", full_query[:40])
+        return ""
 
     db = _get_db()
     try:

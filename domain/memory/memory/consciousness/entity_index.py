@@ -127,8 +127,7 @@ def update_entity_index(
 
         # Avoid inserting duplicate memory entries (same memory_id).
         # Deep-copy memory_entry so each entity gets its own dict — prevents
-        # shared-reference bugs when bump_verification/touch_last_accessed
-        # modify one entity's copy.
+        # shared-reference bugs when bump_verification modifies one entity's copy.
         existing_ids = {m.get("memory_id") for m in entity["memories"]}
         if memory_id not in existing_ids:
             entity["memories"].append(dict(memory_entry))
@@ -270,12 +269,10 @@ def query_entities_ranked(
         keep_fragments = max(0, limit - len(used_profile))
         top_mems = used_profile + top_mems[:keep_fragments]
 
-    # Update last_accessed for returned fragments (profile 卡不是真实 memory,跳过)
-    for mem in top_mems:
-        mid = str(mem.get("memory_id", ""))
-        if mem.get("memory_type") != "profile" and mid:
-            touch_last_accessed(mid)
-
+    # last_accessed 历史上由 touch_last_accessed 在每次召回时回写，但该字段从未被
+    # 任何打分/读取路径消费（_compute_recency 用的是 timestamp）。回写只会触发
+    # 整份 entity_index.json 的读改写——每次召回 N 条命中 = N 次全文件 IO。
+    # 已移除该写路径；memory_entry 里的 last_accessed 字段保留为 None 不再更新。
     return top_mems
 
 
@@ -468,19 +465,6 @@ def bump_verification(memory_id: str) -> None:
         for mem in entity_data.get("memories", []):
             if mem.get("memory_id") == memory_id:
                 mem["verification_count"] = int(mem.get("verification_count", 0)) + 1
-                save_entity_index(data)
-                return
-
-
-def touch_last_accessed(memory_id: str) -> None:
-    """Update last_accessed timestamp for a memory entry."""
-    if not memory_id:
-        return
-    data = load_entity_index()
-    for entity_data in data.get("entities", {}).values():
-        for mem in entity_data.get("memories", []):
-            if mem.get("memory_id") == memory_id:
-                mem["last_accessed"] = _now_iso()
                 save_entity_index(data)
                 return
 
@@ -751,7 +735,6 @@ __all__ = [
     "get_entity_heatmap",
     "bump_verification",
     "bump_verification_for_entities",
-    "touch_last_accessed",
     "get_entity_summary",
     # Concept memory API:
     "set_entity_profile",
