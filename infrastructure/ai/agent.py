@@ -670,7 +670,11 @@ class AIAgent:
     def _trip_circuit_breaker(self, response: "httpx.Response") -> None:
         """收到 429 时触发账号级熔断（按 api_key 分区，跨实例共享）。
 
-        从 429 响应头读 Retry-After 并按 resolve_retry_after 解析出熔断时长，
+        综合 Retry-After 头 + 响应体 ``error.code`` 决定熔断时长：
+          - 余额不足/套餐失效（code 1113/1314/1311）→ 拉到 MAX（等也没用，
+            充值前重试必败，长熔断避免反复刷 expires_at）。
+          - 限流（code 1302/1305/...）→ 沿用 Retry-After 头。
+          - 未知 code → 保守沿用 Retry-After / 默认窗口。
         写入共享 circuit_breaker.db（WAL，跨进程可见）。同 key 的其它实例
         下次在 cron / _wake_or_inject / _chat 入口读到熔断即停止打 API。
 
@@ -678,12 +682,25 @@ class AIAgent:
         正常的 429 重试链改成抛异常（同 _record_token_usage 的 swallow 策略）。
         """
         try:
-            from infrastructure.budget.circuit_breaker import trip, resolve_retry_after
+            from infrastructure.budget.circuit_breaker import (
+                trip, resolve_retry_after_for_429,
+            )
             ra = response.headers.get("Retry-After") or response.headers.get("retry-after")
+            # 解析 body 的 error.code 做硬/软故障分类（429 状态码本身无法区分）
+            body: Any = None
+            try:
+                body = response.json()
+            except Exception:
+                body = response.text or None
+            retry_after_sec, reason = resolve_retry_after_for_429(
+                retry_after_header=ra,
+                response_body=body,
+            )
             trip(
                 self.api_key or "",
-                retry_after_sec=resolve_retry_after(ra),
+                retry_after_sec=retry_after_sec,
                 instance_id=self.instance_id or "",
+                reason=reason,
             )
         except Exception as exc:
             logger.debug("circuit breaker trip failed: %s", exc)
