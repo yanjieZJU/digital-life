@@ -2579,17 +2579,17 @@ def _handle_rest(args: Dict[str, Any], **kwargs) -> str:
 
     now = _clock.beijing_now_dt()
 
-    # ─── 路径 A：reuse=<alarm_id>，复用现有 timer ───
+    # ─── 路径 A：reuse=<alarm_id>，复用现有 timer/routine ───
     if reuse_id > 0:
-        # 找对应的 timer 闹钟
+        # 找对应的闹钟（查 timer + routine，和重叠检测的数据源一致）
         target_alarm = None
-        for a in list_pending_alarms("timer"):
+        for a in list_pending_alarms("timer") + list_pending_alarms("routine"):
             if (a.get("id") or 0) == reuse_id:
                 target_alarm = a
                 break
         if not target_alarm:
             return registry.tool_error(
-                f"reuse={reuse_id} 失败：找不到这个 timer 闹钟。"
+                f"reuse={reuse_id} 失败：找不到这个闹钟（timer/routine）。"
                 f"先用 sense_schedule 看现有闹钟 id，或改用 rest(until=...)"
             )
 
@@ -2722,7 +2722,7 @@ def _handle_rest(args: Dict[str, Any], **kwargs) -> str:
     overlap_alarm_id = 0
     overlap_alarm_fire_at = ""
     overlap_alarm_reason = ""
-    for a in list_pending_alarms("timer"):
+    for a in list_pending_alarms("timer") + list_pending_alarms("routine"):
         fa = a.get("fire_at") or ""
         if not fa:
             continue
@@ -2744,7 +2744,7 @@ def _handle_rest(args: Dict[str, Any], **kwargs) -> str:
     # 让模型先扫一眼要不要补 todo/project，处理完再 reuse 或换时间。
     if overlap_alarm_id:
         overlap_msg = (
-            f"until={target_iso} 和现有 timer 闹钟 #{overlap_alarm_id}"
+            f"until={target_iso} 和现有闹钟 #{overlap_alarm_id}"
             f"（{overlap_alarm_fire_at}"
             + (f"，reason={overlap_alarm_reason}" if overlap_alarm_reason else "")
             + f"）重叠。\n"
