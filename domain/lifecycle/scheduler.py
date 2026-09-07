@@ -1146,6 +1146,46 @@ def _wake_digital_life_inner_safe(
             slow_ctx.insert(0, {"role": "user", "content": ref_context, "_sys_tool": "system_context"})
         prev_history.extend(slow_ctx)
 
+        # self_cognition: 结晶自我——从自主世界遭遇反应中长出的稳定立场（"我是谁"）。
+        # 在 first-thought 即治理 agent 的 stance，在任何 sense 工具调用之前。
+        # 与 session digest 并存：digest 是"我做了什么"，self_cognition 是"我是谁"。
+        # 空槽位（dream 尚未结晶）→ 跳过注入，回退 digest-only wake（spec: 空槽位优雅回退）。
+        try:
+            from domain.memory.memory.self_cognition import (
+                read_self_cognition,
+                render_self_cognition_section,
+            )
+            _self_section = render_self_cognition_section(read_self_cognition())
+            if _self_section:
+                prev_history.append({
+                    "role": "user",
+                    "content": _self_section,
+                    "_sys_tool": "self_cognition",
+                })
+        except Exception as exc:
+            logger.debug("self_cognition inject failed: %s", exc)
+
+        # world_encounter: 主动探索时遭遇世界（outward），而非向内 navel-gaze。
+        # reason==initiative 即 idle 高能——vital 系统的 initiative 触发阈值本身
+        # 就是能量门控（低于自主探索阈值不会 fire initiative）。遭遇源给出一个
+        # 探索方向（种子或自驱），作为感知事件注入；agent 自行用 web_search 去看
+        # 世界、形成反应。无种子且无自驱历史 → 优雅空转（不产生遭遇）。
+        if reason == "initiative":
+            try:
+                from domain.memory.memory.encounter import (
+                    pick_encounter_topic,
+                    render_encounter_direction,
+                )
+                _encounter_topic = pick_encounter_topic()
+                if _encounter_topic:
+                    prev_history.append({
+                        "role": "user",
+                        "content": render_encounter_direction(_encounter_topic),
+                        "_sys_tool": "world_encounter",
+                    })
+            except Exception as exc:
+                logger.debug("world_encounter inject failed: %s", exc)
+
         # social_context:oplastics contacts + 群 + 岗位，让模型决定回哪发哪
         try:
             from domain.social_context import render_social_context

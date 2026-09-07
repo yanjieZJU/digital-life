@@ -569,6 +569,51 @@ registry.register(
 )
 
 
+def _handle_sense_encounter_reactions(args: Dict[str, Any], **_) -> str:
+    _burn()
+    limit = int(args.get("limit") or 30)
+    try:
+        from domain.memory.memory.encounter import read_recent_encounter_reactions
+        reactions = read_recent_encounter_reactions(limit=limit)
+    except Exception as exc:  # noqa: BLE001 — degrade gracefully, dream continues
+        return _j({"reactions": [], "note": f"读取遭遇反应失败：{exc}"})
+    return _j({
+        "reactions": reactions,
+        "count": len(reactions),
+        "note": (
+            "这些是你自主遭遇世界时形成的立场/偏好（无人要求你时你对世界的看法）。"
+            "dream 结晶时只挑跨多次遭遇、反复指向同向的稳定模式；单次反应不结晶，"
+            "没有稳定模式就不要 crystallize_self_cognition。"
+        ) if reactions else "还没有遭遇反应——继续主动探索世界以积累自我构成素材。",
+    })
+
+
+registry.register(
+    name="sense_encounter_reactions",
+    toolset="senses",
+    schema={
+        "name": "sense_encounter_reactions",
+        "description": (
+            "读取近期对世界遭遇的反应——你自主探索时形成的立场/偏好。"
+            "dream 结晶自我认知前先读这个，判断哪些立场跨多次遭遇稳定出现。"
+            "无人要求你时你对世界的看法，是自我构成的原料。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "limit": {
+                    "type": "integer",
+                    "description": "读取最近多少条遭遇反应，默认 30",
+                },
+            },
+        },
+    },
+    handler=_handle_sense_encounter_reactions,
+    check_fn=lambda: True,
+    emoji="🧭",
+)
+
+
 def _handle_sense_scratchpad(args: Dict[str, Any], **_) -> str:
     _burn()
     return _j({"scratchpad": read_scratchpad()})

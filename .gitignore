@@ -157,3 +157,6 @@ todos/
 
 # ZCode 客户端本地产物（含 plan、缓存等），不入 git
 .zcode/
+
+# Kimi Code 客户端本地产物，不入 git
+.kimi-code/

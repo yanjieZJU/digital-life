@@ -677,7 +677,34 @@ global_todos.db 单点真相后，这些操作变成 O(1)：
 
 ### 9.5 自我认知
 
-SELF_KNOWLEDGE.md 独立于上述碎片循环——它是"我在什么情况下会怎么做"的行为模式观察，由 `sense_self_knowledge` 工具读写，只在 `initiative` / `self_iteration` 事件唤醒时按需注入（不进每次 wake prompt）。它和实体记忆是两条独立的线。
+自我认知分两层，互不覆写：
+
+**观察性自述（self-description）**——`SELF_KNOWLEDGE.md`。它是"我在什么情况下会怎么做"的行为模式观察，由 `sense_self_knowledge` 工具读写，只在 `initiative` / `self_iteration` 事件唤醒时按需注入（不进每次 wake prompt）。它和实体记忆是两条独立的线。这是"自我作为客体"——描述自己，但仍可能带着服务用户的姿态。
+
+**构成性自我（self-constitution）**——`self_cognition` 慢变量。这是"自我作为主体"：从自主遭遇世界的反应中长出稳定立场，反过来治理下一次醒来的第一念。闭环如下：
+
+```
+idle 高能（initiative 唤醒，无用户任务）
+   → world_encounter：遭遇源给一个探索方向（种子 CURIOSITY_SEED.md 或自驱历史），
+        作为感知事件注入（_sys_tool=world_encounter），而非直接 prompt
+   → agent 用 web_search 自行去看世界、形成反应
+   → record_encounter_reaction：把"没人要求我时我对世界的立场/偏好"记为
+        memory_layers.db 的 layer='encounter_reaction'（与 lesson / consciousness 区分）
+   → dream 结晶：读近期 encounter_reaction，挑跨多次遭遇、反复指向同向的稳定模式
+        → crystallize_self_cognition 写入 self_cognition 慢变量（首个生产写入方）
+        → 无稳定模式则不写（不捏造自我）
+   → 下次 wake：self_cognition 在任何 sense 工具调用前注入 slow-context
+        （_sys_tool=self_cognition），与 session digest 并存——
+        digest 是"我做了什么"，self_cognition 是"我是谁"
+```
+
+关键设计点：
+- **遭遇是事件不是 prompt**。用户输入在本系统里本就是"与他相关的事件"而非直插大脑的 prompt；自主遭遇遵循同一管线——给出的是探索方向（感知事件），agent 自己去 sense 内容，于是遭遇是被感知的而非被告知的。这保全了"反应里的我"。
+- **种子 + 衰减**。`CURIOSITY_SEED.md` 打破冷启动的向内引力（无外部刺激时 agent 只能"看见"内部，自主性会塌缩成 navel-gazing）；种子贡献随自驱探索历史增长而衰减（`1/(1+n)`），agent 自己的好奇心线索逐步主导方向选择。
+- **结晶保守**。仅跨多次遭遇的稳定模式结晶；`self_cognition` 是独立 `slow_var` kind，不覆写 persona 文件与 `SELF_KNOWLEDGE.md`。人格（MBTI-like）是涌现的而非被指派的。
+- **空槽位优雅回退**。dream 尚未结晶时，wake 跳过注入、回退 digest-only，不阻断。
+
+相关工具：`sense_encounter_reactions`（读近期反应）、`record_encounter_reaction`（捕获反应）、`crystallize_self_cognition`（dream 结晶写入）。dream 结晶步骤定义在 `memory_hygiene` skill §7.6。
 
 ### 9.6 个人记忆与项目记忆
 

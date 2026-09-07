@@ -63,6 +63,16 @@ from domain.memory.memory.consciousness.runtime import (
     append_insight as _append_insight,
     update_self_knowledge as _update_self_knowledge,
 )
+from domain.memory.memory.encounter import (
+    record_encounter_reaction as _record_encounter_reaction,
+    record_self_driven_topic as _record_self_driven_topic,
+)
+from domain.memory.memory.self_cognition import (
+    SelfCognition as _SelfCognition,
+    Stance as _Stance,
+    write_self_cognition as _write_self_cognition,
+    render_self_cognition_section as _render_self_cognition_section,
+)
 
 from interfaces.tools.registry import registry
 
@@ -1862,9 +1872,174 @@ registry.register(
 )
 
 
+# ──────────────────────────────── record_encounter_reaction ───────────────────────────
+# 自我构成素材入口：当 agent 在主动探索中遭遇世界并形成看法时，把反应记下来。
+# 与 add_lesson 区别——lesson 是"为任务服务的得失总结"；encounter_reaction 是
+# "没人问我时，我对世界的立场/偏好"，是 dream 结晶 self_cognition 的原料。
+def _handle_record_encounter_reaction(args: Dict[str, Any], **_) -> str:
+    topic = (args.get("topic") or "").strip()
+    stance = (args.get("stance") or "").strip()
+    if not topic or not stance:
+        return registry.tool_error("topic and stance are required")
+
+    snap = vitals.consume_energy(ENERGY_COST_PER_CALL)
+    encounter_ref = (args.get("encounter_ref") or "").strip()
+    evidence = (args.get("evidence") or "").strip()
+    next_curiosity = (args.get("next_curiosity") or "").strip()
+
+    period = _record_encounter_reaction(
+        topic=topic, stance=stance, encounter_ref=encounter_ref, evidence=evidence,
+    )
+    # Agent 自驱选定下一个探索方向 → 记入自驱历史，衰减种子、延续好奇心线索。
+    if next_curiosity:
+        _record_self_driven_topic(next_curiosity)
+
+    return _j({
+        "ok": True,
+        "note": "遭遇反应已记录为自我构成素材。它会在 dream 中参与结晶。"
+                + (" 下一个探索方向已记下。" if next_curiosity else ""),
+        "reaction_id": period,
+        "energy": round(snap.energy, 1),
+    })
+
+
+registry.register(
+    name="record_encounter_reaction",
+    toolset="actions",
+    schema={
+        "name": "record_encounter_reaction",
+        "description": (
+            "记录你对一次世界遭遇的反应——你的立场、偏好、吸引或排斥。"
+            "这是'没人要求你时你对世界的看法'，是自我构成的素材，会在 dream 中结晶成你的自我认知。"
+            "区别于 add_lesson（任务得失）和 record_thought（连续思绪）。\n\n"
+            "参数：\n"
+            "- topic: 必填。遭遇的主题/方向（来自 world_encounter 或你自己选的）。\n"
+            "- stance: 必填。你的反应——吸引了你/让你排斥/让你好奇/无感，以及为什么。写你真实的立场，不是客观摘要。\n"
+            "- encounter_ref: 可选。遭遇来源（如 web 搜索关键词、URL），供结晶溯源。\n"
+            "- evidence: 可选。支撑你立场的具体观察。\n"
+            "- next_curiosity: 可选。这次遭遇激发的下一个想探索的方向——会记下来驱动你后续的自主探索。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "遭遇的主题/方向"},
+                "stance": {"type": "string", "description": "你的真实反应与立场（吸引/排斥/好奇/无感 + 为什么）"},
+                "encounter_ref": {"type": "string", "description": "遭遇来源（搜索词/URL 等），供溯源"},
+                "evidence": {"type": "string", "description": "支撑立场的具体观察"},
+                "next_curiosity": {"type": "string", "description": "激发的下一个探索方向，驱动后续自主遭遇"},
+            },
+            "required": ["topic", "stance"],
+        },
+    },
+    handler=_handle_record_encounter_reaction,
+    check_fn=lambda: True,
+    emoji="🧭",
+)
+
+
+# ──────────────────────────────── crystallize_self_cognition ───────────────────────────
+# dream 结晶：读近期 encounter_reaction → 模型判断跨多次遭遇的稳定立场模式 → 写入
+# self_cognition 慢变量。这是 self_cognition 槽位的首个生产写入方（之前只有冒烟测试）。
+# 保守约束（spec：无稳定模式不结晶）：summary/stances 任一为空即 tool_error，绝不捏造自我；
+# self_cognition 是独立 slow_var kind，与 persona 文件、SELF_KNOWLEDGE.md 互不覆写。
+def _handle_crystallize_self_cognition(args: Dict[str, Any], **_) -> str:
+    summary = (args.get("summary") or "").strip()
+    raw_stances = args.get("stances") or []
+    if not summary:
+        return registry.tool_error("summary is required — do not crystallize a self from nothing")
+    if not isinstance(raw_stances, list) or not raw_stances:
+        return registry.tool_error("stances is required — only crystallize stable cross-encounter patterns")
+
+    stances: list[_Stance] = []
+    for s in raw_stances:
+        if not isinstance(s, dict):
+            continue
+        topic = (s.get("topic") or "").strip()
+        stance = (s.get("stance") or "").strip()
+        if not topic or not stance:
+            continue
+        refs = s.get("evidence_refs") or []
+        if not isinstance(refs, list):
+            refs = [str(refs)]
+        stances.append(_Stance(topic=topic, stance=stance, evidence_refs=[str(r) for r in refs]))
+    if not stances:
+        return registry.tool_error("no valid stances — each needs topic + stance")
+
+    snap = vitals.consume_energy(ENERGY_COST_PER_CALL)
+    source_count = int(args.get("source_encounter_count") or 0)
+
+    cognition = _SelfCognition(
+        summary=summary,
+        stances=stances,
+        last_crystallized_at=datetime.now().isoformat(),
+        source_encounter_count=source_count,
+    )
+    _write_self_cognition(cognition)
+
+    return _j({
+        "ok": True,
+        "note": "自我认知已结晶，将治理下次醒来的第一念。"
+                "它独立于 persona 与 SELF_KNOWLEDGE，不覆写它们。",
+        "stance_count": len(stances),
+        "source_encounter_count": source_count,
+        "rendered": _render_self_cognition_section(cognition),
+        "energy": round(snap.energy, 1),
+    })
+
+
+registry.register(
+    name="crystallize_self_cognition",
+    toolset="actions",
+    schema={
+        "name": "crystallize_self_cognition",
+        "description": (
+            "dream 专用：把近期多次世界遭遇反应中重复出现的稳定立场，结晶成你的自我认知。"
+            "结晶后的自我会治理你下次醒来的第一念——不是你被要求做什么，而是'你是谁'。\n\n"
+            "保守原则：\n"
+            "- 只结晶跨多次遭遇、反复指向同一方向的稳定模式。单次反应不结晶。\n"
+            "- 没有稳定模式就不要调用本工具（不捏造自我）。\n"
+            "- 这是独立于 persona / SELF_KNOWLEDGE 的经验层自我，不覆写它们。\n\n"
+            "参数：\n"
+            "- summary: 必填。一两句话概括'经历这些遭遇后我成为了谁'。\n"
+            "- stances: 必填。稳定立场列表，每条 {topic, stance, evidence_refs}。\n"
+            "  - topic: 该立场针对的主题/方向。\n"
+            "  - stance: 你稳定持有的立场（吸引/排斥/好奇/无感 + 为什么），是 earned 的结论不是宣言。\n"
+            "  - evidence_refs: 支撑该立场的遭遇反应来源（reaction_id / 主题），便于溯源。\n"
+            "- source_encounter_count: 可选。本次结晶依据的遭遇反应条数。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "summary": {"type": "string", "description": "经验结晶后的自我概括（一两句）"},
+                "stances": {
+                    "type": "array",
+                    "description": "稳定立场列表（跨多次遭遇、反复指向同向）",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "topic": {"type": "string", "description": "立场针对的主题/方向"},
+                            "stance": {"type": "string", "description": "你稳定持有的立场与原因"},
+                            "evidence_refs": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "description": "支撑该立场的遭遇反应来源（reaction_id / 主题）",
+                            },
+                        },
+                        "required": ["topic", "stance"],
+                    },
+                },
+                "source_encounter_count": {"type": "integer", "description": "本次结晶依据的遭遇反应条数"},
+            },
+            "required": ["summary", "stances"],
+        },
+    },
+    handler=_handle_crystallize_self_cognition,
+    check_fn=lambda: True,
+    emoji="💎",
+)
+
+
 # ──────────────────────────────── add_insight ─────────────────────────────────────────
-# 之前 INSIGHTS.md 是 record_thought(kind != status) 内部副带写,模型不知道这回事,
-# 没有专门写入入口。补 add_insight 让模型显式记灵感/质疑/卡点/警告。
 
 def _handle_add_insight(args: Dict[str, Any], **_) -> str:
     text = (args.get("text") or "").strip()
