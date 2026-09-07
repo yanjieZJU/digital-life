@@ -27,9 +27,14 @@ TOOL_CALLS_COMPACT_WHITELIST: frozenset[str] = frozenset({
     "my_context", "social_context", "session_digest", "entity_recall",
     "wake_signal", "schedule", "workspace", "social_feed",
     "system_context", "sense_status", "sense_schedule",
+    "self_cognition", "world_encounter",
     # ── 写操作 (agent 要回看"我做了什么") ──
-    "express_to_human", "rest", "add_cognition", "record_thought",
-    "update_cognition", "supersede_memory", "register_tool", "register_skill",
+    "express_to_human", "rest", "record_thought",
+    "add_lesson", "add_insight", "update_self_knowledge",
+    "update_rules", "update_context", "update_scratchpad",
+    "remember_him", "write_diary",
+    "record_encounter_reaction", "crystallize_self_cognition",
+    "register_tool", "register_skill",
 })
 
 
