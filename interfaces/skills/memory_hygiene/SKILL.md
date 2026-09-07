@@ -45,10 +45,13 @@ platforms: []
 |---|---|
 | 意识流 status 报告 ≥ 5 | P0 必清(机械可删) |
 | SCRATCHPAD 并行任务 ≥ 3 | P0 必清(看你今天到底在干什么) |
+| 认知积压(challenged ≥ 3 或待归档 ≥ 20) | P0 §7.7 认知体检(challenged 不留过夜) |
 | LESSONS 某 section > 25 | P1 合并(嗅觉真心思考) |
 | INSIGHTS > 30 总数 | P1 升级/删(个别判断) |
 | 某文件 7 天没动 | P2 标注(不强制删) |
 | RULES > 40 节 | P2 看哪些项目死了 |
+
+「· 认知」行(不带 ⚠)说明有少量积压但不达阈值——正常节奏里 §7.7 顺手清掉即可。
 
 只跑一项 P0/P1 是不够的,至少把 P0 全处理完。
 
@@ -320,6 +323,44 @@ a→d 都是对索引做**归类 / 清扫**(删噪音、合别名、清悬空、
 - ❌ 覆写 persona —— 结晶自我只写 `self_cognition`,不动 persona 文件
 - ❌ 每晚强行重写 —— 旧结晶仍成立就保留
 
+#### 7.7 认知体检(核心 step,认知债清偿)
+
+> 记忆会腐烂,结论会被推翻。前面的步骤整理「记了什么」——这一步处理
+> 「哪些旧结论已经不对了、哪些碎片已经凉透了」。不处理它们不会报错,
+> 但会以高分权威继续参与联想,污染你接下来的每一个判断。
+
+**做什么**:
+
+1. 调 `sense_cognition_backlog`,拿到三张清单:
+   - **challenged**(被证伪 ≥ 2 次待决断)——最高优先级
+   - **to_archive**(新鲜度已跌破衰减线,如 >60 天的 consciousness 碎片)
+   - **recent_supersede**(最近的结论推翻链)
+2. **challenged 逐条决断,不留过夜**。用 `recall_entity` 拉上下文看清原文,
+   然后 `update_memory_cognition` 二选一:
+   - `action=supersede, new_text=修正后的结论` —— 结论确实变了,留链推翻
+   - `action=verify` —— 是误证伪,原文仍成立(计数+1,恢复 active)
+3. **衰减归档一把梭**:`update_memory_cognition(action=archive, scope=decayed)`。
+   归档不删除——碎片只是退出联想召回,dream 审计时仍可 `action=restore` 找回。
+4. 清单全空 → 本步 30 秒收工,这是常态(新鲜度按半衰期惰性计算,不写盘)。
+
+**保守约束(只有这几条)**:
+- challenged 决断只看证据,不看情绪——「连续两次被事实打脸」才算 challenged,
+  单次冲突已经是 falsify 信号但还没到决断线。
+- 归档只交给 `scope=decayed`(纯函数判定),**绝不手动指定某条记忆归档**——
+  你觉得「没用了」的记忆可能是错的,时间衰减才是客观标准。
+- supersede 时 `new_text` 必须是完整的新结论,不是对旧结论的批注。
+
+**完成定义**:
+- challenged 清单清空(每条 supersede 或 verify)
+- to_archive 已批量归档(audit trail 记条数)
+- 两张清单本来为空 → audit trail 记「认知体检: 无积压」
+
+**反模式**:
+- ❌ challenged 留过夜 —— 悬而未决的认知债会以半权威持续污染联想
+- ❌ 手动挑记忆归档 —— 只用 scope=decayed,时间才是裁判
+- ❌ supersede 不写 new_text 只改状态 —— 推翻必须给出新结论,否则用 verify/falsify
+- ❌ 把归档当删除反复 restore —— restore 是周度回看纠错用的,不是日常操作
+
 ### 8. 写 [整理] audit trail(必做)
 
 整理全做完,在 CONSCIOUSNESS.md 顶部 record_thought 一行(用 `record_thought(kind=status)`):
@@ -334,6 +375,7 @@ a→d 都是对索引做**归类 / 清扫**(删噪音、合别名、清悬空、
   - entity_index 砍 noise 329→~200, 合别名 8 对, 清 dangling 12 条, 补 entity 5 条
   - 消化实体 profile: 华能蒙电/论断4/张浩普 … 共 N 个(其余下次继续)
   - 自我认知结晶: N 条稳定立场(或「无稳定模式,保持现状」)
+  - 认知体检: 处理 challenged N 条, 归档 M 条(或「无积压」)
 下次醒来应在「## 记忆体检」段看到 ✓ 记忆状态健康。
 ```
 
@@ -351,6 +393,10 @@ a→d 都是对索引做**归类 / 清扫**(删噪音、合别名、清悬空、
 - **跨 section 合并**:同主题可能散在多 section(比如「论断4」可能在 trading + workflow 同时出现)
 - **entity_index 过期扫**: 30 天没出现在 wake context 的实体 = dead, **手动 prune**(用 `prune_fragments_for_entity` 工具)
 - **archive 回填**: CONSCIOUSNESS.archive.md 里仍 active 的 lesson 可回填到 LESSONS.md 主文件,重新生效
+- **supersede 链回看**: `sense_cognition_backlog` 的 recent_supersede 里,
+  本周推翻过的结论逐条问「当时推翻对了吗」。误判的用
+  `update_memory_cognition(action=restore)` 找回 + 把后来那条错误结论 supersede 掉。
+  认知更新要可逆,但纠错只在周度做——避免 nightly 反复横跳。
 
 ## Template(可选直接抄)
 

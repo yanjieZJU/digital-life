@@ -704,28 +704,6 @@ def load_segment_narrative(session_id: str, segment_index: int) -> Optional[str]
         db.close()
 
 
-def update_entity_index_from_narrative(narrative: str) -> None:
-    """从叙事中提取实体并更新 entity_index（只追加新实体）。"""
-    try:
-        from domain.memory.memory.consciousness.entity_index import (
-            extract_entities_from_context,
-            add_entity,
-        )
-        entities = extract_entities_from_context(narrative)
-        for entity in entities:
-            try:
-                add_entity(
-                    name=entity.get("name", ""),
-                    entity_type=entity.get("type", "unknown"),
-                    context=narrative[:500],
-                    source_session="",
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-
 _SESSION_SUMMARY_PROMPT = """你是一个数字生命的记忆总结助手。请根据以下对话记录，生成一段简洁的记忆摘要。
 
 要求：
@@ -802,22 +780,16 @@ def _generate_segment_narratives_async(session_db: Any, session_id: str) -> None
 
 
 def _generate_segment_narratives_worker(session_db: Any, session_id: str, db_path: str) -> None:
-    """后台线程 worker：生成段叙事并更新 entity_index。"""
+    """后台线程 worker：生成段叙事。
+
+    （曾有"从叙事自动提取实体写入 entity_index"的钩子，因引用不存在的
+    add_entity 从未生效；已删除——自动造实体与 entity_curation 的
+    "砍噪音实体"治理原则对撞，修复等于复活噪音源。）
+    """
     try:
         db = sqlite.connect(db_path)
         db.row_factory = sqlite.Row
         generated = _generate_all_segment_narratives(session_db, session_id, db)
-
-        # 从已生成的叙事中提取实体并更新 index
-        if generated > 0:
-            rows = db.execute(
-                "SELECT llm_summary FROM memory_layers WHERE layer='segment' AND period LIKE ?",
-                (f"{session_id}#%",),
-            ).fetchall()
-            for row in rows:
-                if row["llm_summary"]:
-                    update_entity_index_from_narrative(row["llm_summary"])
-
         db.close()
         logger.info("Segment narratives generated for %s: %d segments", session_id[:20], generated)
     except Exception as e:
@@ -1856,5 +1828,4 @@ __all__ = [
     # Segment narrative APIs
     "load_segment_narrative",
     "_lazy_generate_segment_narrative",
-    "update_entity_index_from_narrative",
 ]

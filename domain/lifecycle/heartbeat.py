@@ -185,6 +185,25 @@ def _memory_health_snapshot() -> str:
         except Exception:
             pass
 
+        # 认知积压计数（challenged 待决断 / 衰减待归档）——dream 无需额外
+        # sense 调用就能在 prompt 顶部看到认知债，决定是否跑认知体检
+        try:
+            from domain.memory.memory.consciousness.entity_index import cognition_backlog
+            backlog = cognition_backlog()
+            challenged_n = int(backlog.get("challenged_count", 0))
+            to_archive_n = int(backlog.get("to_archive_count", 0))
+            if challenged_n or to_archive_n:
+                cog_parts = []
+                if challenged_n:
+                    cog_parts.append(f"challenged {challenged_n} 条待决断")
+                if to_archive_n:
+                    cog_parts.append(f"{to_archive_n} 条低于衰减线待归档")
+                lines.append("  · 认知  " + " · ".join(cog_parts))
+                if challenged_n >= 3 or to_archive_n >= 20:
+                    warn_items.append(f"认知积压({'/'.join(cog_parts)})——dream 跑 memory_hygiene §7.7 认知体检")
+        except Exception:
+            pass
+
         if warn_items:
             lines.append("  ⚠ 待清理: " + " · ".join(warn_items))
         else:

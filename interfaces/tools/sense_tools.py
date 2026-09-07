@@ -1143,7 +1143,8 @@ def _handle_sense_entity(args: Dict[str, Any], **_) -> str:
         "aliases": summary.get("aliases", []),
         "profile": profile,
         "memories": [
-            {"type": m.get("memory_type"), "snippet": m.get("snippet", "")[:150],
+            {"memory_id": m.get("memory_id"),
+             "type": m.get("memory_type"), "snippet": m.get("snippet", "")[:150],
              "timestamp": m.get("timestamp"), "verification_count": m.get("verification_count", 0)}
             for m in memories
         ],
@@ -1440,14 +1441,21 @@ def _handle_recall_entity(args: Dict[str, Any], **_) -> str:
             result["profile"] = profile
         memories = info.get("memories", [])
         result["fragment_count"] = len(memories)
-        # Return top 5 most recent fragments with text
+        # Return top 5 most recent fragments with text.
+        # memory_id 必须带——update_memory_cognition 按 id 定位操作对象；
+        # status/superseded_by 让模型主动深挖时看到"已推翻/待决断"的链注记
+        # （被动联想注入不出现历史，主动查询可见历史）。
         recent = sorted(memories, key=lambda m: m.get("timestamp", ""), reverse=True)[:5]
         result["recent_fragments"] = [
             {
+                "memory_id": m.get("memory_id"),
                 "type": m.get("memory_type"),
                 "snippet": str(m.get("snippet", ""))[:200],
                 "timestamp": m.get("timestamp"),
                 "verification_count": m.get("verification_count", 0),
+                **({"status": m["status"]} if m.get("status") else {}),
+                **({"superseded_by": m["superseded_by"]} if m.get("superseded_by") else {}),
+                **({"cog_key": m["cog_key"]} if m.get("cog_key") else {}),
             }
             for m in recent
         ]
@@ -1478,6 +1486,42 @@ registry.register(
     handler=_handle_recall_entity,
     check_fn=lambda: True,
     emoji="🔗",
+)
+
+
+# ──────────────────────────────── sense_cognition_backlog (认知积压) ────────────────────────
+
+def _handle_sense_cognition_backlog(_: Dict[str, Any], **_kwargs) -> str:
+    """认知积压三张清单：challenged 待决断 / 衰减待归档 / 最近推翻链。"""
+    _burn(0.1)
+    try:
+        from domain.memory.memory.consciousness.entity_index import cognition_backlog
+        return _j(cognition_backlog())
+    except ImportError:
+        return _j({"ok": False, "reason": "entity_index 模块不可用"})
+    except Exception as exc:
+        return _j({"error": str(exc)})
+
+
+registry.register(
+    name="sense_cognition_backlog",
+    toolset="senses",
+    schema={
+        "name": "sense_cognition_backlog",
+        "description": (
+            "认知积压清单：①challenged（被证伪待决断，需 supersede 或 verify）"
+            "②to_archive（新鲜度已低于衰减线、待归档的碎片）"
+            "③recent_supersede（最近的结论推翻链）。"
+            "dream 认知体检第一步；wake 时想快速知道自己有哪些悬而未决的认知债也可调。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {},
+        },
+    },
+    handler=_handle_sense_cognition_backlog,
+    check_fn=lambda: True,
+    emoji="🧠",
 )
 
 

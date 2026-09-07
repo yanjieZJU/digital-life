@@ -34,6 +34,7 @@ TOOL_CALLS_COMPACT_WHITELIST: frozenset[str] = frozenset({
     "update_rules", "update_context", "update_scratchpad",
     "remember_him", "write_diary",
     "record_encounter_reaction", "crystallize_self_cognition",
+    "update_memory_cognition",
     "register_tool", "register_skill",
 })
 

@@ -174,7 +174,8 @@ def _ensure_files() -> None:
 _STATE_REPORT_TAGS: tuple[str, ...] = ("trading_wait", "system_wait", "final_status")
 
 
-def record_thought(text: str, tag: str = "", entities: list[str] | None = None) -> bool:
+def record_thought(text: str, tag: str = "", entities: list[str] | None = None,
+                   cog_key: str = "") -> bool:
     """在意识流里追加一段思绪。
 
     State-report tags (trading_wait/system_wait/final_status): replaces
@@ -204,7 +205,7 @@ def record_thought(text: str, tag: str = "", entities: list[str] | None = None) 
             if entities:
                 _write_entities(entities, memory_type="consciousness",
                                 memory_id=f"consciousness:{now_iso()}", snippet=text, tag=tag,
-                                replace_state=True)
+                                replace_state=True, cog_key=cog_key)
             return True
 
     # Non-state-report: skip if duplicate
@@ -217,13 +218,14 @@ def record_thought(text: str, tag: str = "", entities: list[str] | None = None) 
 
     if entities:
         _write_entities(entities, memory_type="consciousness",
-                        memory_id=f"consciousness:{now_iso()}", snippet=text, tag=tag)
+                        memory_id=f"consciousness:{now_iso()}", snippet=text, tag=tag,
+                        cog_key=cog_key)
     return True
 
 
 def _write_entities(entities: list[str], *, memory_type: str,
                     memory_id: str, snippet: str = "", tag: str = "",
-                    replace_state: bool = False) -> None:
+                    replace_state: bool = False, cog_key: str = "") -> None:
     if _update_entity_index is None:
         return
     try:
@@ -233,7 +235,8 @@ def _write_entities(entities: list[str], *, memory_type: str,
         _update_entity_index(entities, memory_type=memory_type,
                              memory_id=memory_id, snippet=snippet, tag=tag,
                              linked_entities=entities,
-                             replace_existing=replace_state)
+                             replace_existing=replace_state,
+                             cog_key=cog_key)
     except Exception:
         pass
 
@@ -866,7 +869,8 @@ kind 语义：
 """
 
 
-def append_insight(*, kind: str, text: str, tag: str = "", entities: list[str] | None = None) -> Path:
+def append_insight(*, kind: str, text: str, tag: str = "", entities: list[str] | None = None,
+                   cog_key: str = "") -> Path:
     """追加一条灵感碎片到 INSIGHTS.md。
 
     Args:
@@ -895,8 +899,10 @@ def append_insight(*, kind: str, text: str, tag: str = "", entities: list[str] |
         f.write(line)
 
     if entities:
+        # record_thought 双写时与 consciousness 条目共用同一 cog_key——
+        # 同一认知的两种载体（查重域限定同 memory_type，跨类型共存合法）
         _write_entities(entities, memory_type="insight",
-                        memory_id=f"insight:{ts}", snippet=text)
+                        memory_id=f"insight:{ts}", snippet=text, cog_key=cog_key)
 
     return p
 
@@ -965,7 +971,8 @@ def clear_insights_older_than(days: int = 7) -> int:
     return removed
 
 
-def add_lesson(text: str, entities: list[str] | None = None, section: str = "other") -> None:
+def add_lesson(text: str, entities: list[str] | None = None, section: str = "other",
+               cog_key: str = "") -> None:
     """追加一条经验教训,按主题分节写入。
 
     section 是主题分类,LESSONS.md 按这个组织。可选:
@@ -1076,7 +1083,7 @@ def add_lesson(text: str, entities: list[str] | None = None, section: str = "oth
         except Exception:
             pass
         _write_entities(entities, memory_type="lesson",
-                        memory_id=f"lesson:{section}:{ts}", snippet=text)
+                        memory_id=f"lesson:{section}:{ts}", snippet=text, cog_key=cog_key)
 
 
 # ---- 自我认知 (SELF_KNOWLEDGE) ----

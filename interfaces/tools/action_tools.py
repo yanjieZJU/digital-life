@@ -1227,16 +1227,24 @@ def _handle_record_thought(args: Dict[str, Any], **_) -> str:
     # kind 进入 tag（保持 tag 作为自由标签的可选性），同时同步到 INSIGHTS.md
     effective_tag = tag if tag else kind
     entities = args.get("entities")
+    cog_key = (args.get("cog_key") or "").strip()
+    if cog_key:
+        from domain.memory.memory.consciousness.cognition import is_valid_cog_key
+        if not is_valid_cog_key(cog_key):
+            return registry.tool_error(
+                f"cog_key 格式应为 subject:predicate（冒号两侧非空），收到 {cog_key!r}"
+            )
     if entities and isinstance(entities, list):
-        _record(text, tag=effective_tag, entities=entities)
+        _record(text, tag=effective_tag, entities=entities, cog_key=cog_key)
     else:
-        _record(text, tag=effective_tag)
+        _record(text, tag=effective_tag, cog_key=cog_key)
 
     # 非 status 的 kind 同步写 INSIGHTS.md，晚上 self_review 用 sense_insights 拾起来
     if kind != "status":
         try:
             from domain.memory.memory.consciousness.runtime import append_insight
-            append_insight(kind=kind, text=text, tag=tag, entities=entities or [])
+            append_insight(kind=kind, text=text, tag=tag, entities=entities or [],
+                           cog_key=cog_key)
         except Exception:
             pass
 
@@ -1292,6 +1300,7 @@ registry.register(
                 },
                 "tag":  {"type": "string", "description": "可选标签——给 status 自由标签，其他 kind 已隐含 tag"},
                 "entities": {"type": "array", "items": {"type": "string"}, "description": "关联的实体，用于后续检索。如股票代码、工具名、概念名等"},
+                "cog_key": {"type": "string", "description": "结构化认知主键 subject:predicate（如 '华能蒙电:止损线=5.53'）。仅结论性内容才配——同一 key 再次写入时：内容相同=旧结论验证+1；内容变了=自动推翻旧结论留链。过程性思绪不要传"},
             },
             "required": ["text"],
         },
@@ -1812,10 +1821,17 @@ def _handle_add_lesson(args: Dict[str, Any], **_) -> str:
     snap = vitals.consume_energy(ENERGY_COST_PER_CALL)
     entities = args.get("entities")
     section = (args.get("section") or "other").strip().lower()
+    cog_key = (args.get("cog_key") or "").strip()
+    if cog_key:
+        from domain.memory.memory.consciousness.cognition import is_valid_cog_key
+        if not is_valid_cog_key(cog_key):
+            return registry.tool_error(
+                f"cog_key 格式应为 subject:predicate（冒号两侧非空），收到 {cog_key!r}"
+            )
     if entities and isinstance(entities, list):
-        _add_lesson(text, entities=entities, section=section)
+        _add_lesson(text, entities=entities, section=section, cog_key=cog_key)
     else:
-        _add_lesson(text, section=section)
+        _add_lesson(text, section=section, cog_key=cog_key)
 
     # 写入纪律提示:同 section 同主题超阈 → 提示合并而非新写
     warning = ""
@@ -1862,6 +1878,7 @@ registry.register(
                     "enum": ["trading", "system", "tool", "workflow", "rule", "other"],
                 },
                 "entities": {"type": "array", "items": {"type": "string"}, "description": "关联的实体,用于后续检索。如股票代码、工具名、概念名等"},
+                "cog_key": {"type": "string", "description": "结构化认知主键 subject:predicate（如 '华能蒙电:止损线=5.53'）。教训是结论性内容,带了它才能被后续证伪/推翻——同一 key 再次写入时：内容相同=旧结论验证+1；内容变了=自动推翻旧结论留链"},
             },
             "required": ["text"],
         },
@@ -1869,6 +1886,131 @@ registry.register(
     handler=_handle_add_lesson,
     check_fn=lambda: True,
     emoji="💡",
+)
+
+
+# ──────────────────────────────── update_memory_cognition ───────────────────────────
+# 碎片认知生命周期维护：verify / falsify / supersede / archive / restore。
+# 治"认知债"——旧结论被新事实推翻后不再以原权威分污染联想，但保留可追溯链
+# （superseded_by / derived_from），知道自己改过主意的价值放在主动查询路径。
+def _handle_update_memory_cognition(args: Dict[str, Any], **_) -> str:
+    action = (args.get("action") or "").strip().lower()
+    memory_id = (args.get("memory_id") or "").strip()
+    note = (args.get("note") or "").strip()
+    scope = (args.get("scope") or "").strip().lower()
+
+    if action not in ("verify", "falsify", "supersede", "archive", "restore"):
+        return registry.tool_error(f"action 必须是 verify/falsify/supersede/archive/restore，收到 {action!r}")
+
+    try:
+        from domain.memory.memory.consciousness import entity_index as ei
+    except ImportError:
+        return _j({"ok": False, "reason": "entity_index 模块不可用"})
+
+    # 批量归档是唯一不需要 memory_id 的动作（dream 认知体检用）
+    if action == "archive" and scope == "decayed":
+        return _j(ei.archive_decayed_fragments())
+
+    if not memory_id:
+        return registry.tool_error("memory_id 必填（recall_entity / sense_entity 返回里有）；批量归档用 action=archive + scope=decayed")
+
+    if action in ("verify", "falsify"):
+        signal = "verified" if action == "verify" else "falsified"
+        result = ei.apply_cognition_signal(memory_id, signal, note=note)
+        if not result.get("ok"):
+            return _j(result)
+        status_hint = {
+            "challenged": " 已进入 challenged（被证伪待决断）——请安排 supersede 或 verify。",
+            "active": " 恢复/保持 active。",
+        }.get(str(result.get("status")), "")
+        return _j({**result, "note": f"{signal} 已记录。{status_hint}"})
+
+    if action == "supersede":
+        new_text = (args.get("new_text") or "").strip()
+        if not new_text:
+            return registry.tool_error("supersede 需要 new_text（新结论内容）")
+        new_type = (args.get("new_type") or "lesson").strip().lower()
+        if new_type not in ("lesson", "insight", "rule"):
+            return registry.tool_error("new_type 必须是 lesson/insight/rule")
+
+        found = ei.get_fragment_by_id(memory_id)
+        if not found:
+            return _j({"ok": False, "reason": f"memory_id {memory_id!r} 不存在"})
+        old = found["fragment"]
+        # 新碎片默认挂在旧碎片的实体上（可用 entities 参数覆盖）
+        entities = args.get("entities")
+        if not (entities and isinstance(entities, list) and entities):
+            entities = found["entities"] or old.get("linked_entities") or []
+        if not entities:
+            return registry.tool_error(
+                "旧碎片没有挂载实体也无法推断新碎片实体——请显式传 entities")
+
+        # 微秒级时间戳做 id：clock.now_iso 只有秒级分辨率——模型在同一秒内
+        # 连续两次 supersede（一次 tool_calls 批量派发即可能同秒）会撞 id，
+        # 第二次的 new_text 被 existing_ids 去重静默丢弃。
+        from datetime import datetime as _dt
+        new_id = f"{new_type}:{_dt.now().astimezone().isoformat(timespec='microseconds')}"
+        write_result = ei.update_entity_index(
+            entities, memory_type=new_type, memory_id=new_id,
+            snippet=new_text, cog_key=str(old.get("cog_key", "") or ""),
+        )
+        if write_result.get("action") == "skip_bumped":
+            # 旧碎片已有同 key 同值结论（写时查重拦截）——无需再翻转
+            return _j({"ok": True, "action": "skip_bumped",
+                       "note": f"同 cog_key 已有相同内容的碎片 {write_result.get('memory_id')}，已验证+1，未新建",
+                       "write": write_result})
+        # 同 key 异值时 update_entity_index 的写时查重可能已自动建链；
+        # 手动 apply_supersede 兜底（旧碎片无 cog_key 的场景），幂等。
+        link = ei.apply_supersede(memory_id, new_id, note=note)
+        return _j({"ok": True, "action": "superseded", "new_memory_id": new_id,
+                   "link": link,
+                   "note": f"新碎片 {new_id} 已写入，旧碎片 {memory_id} 已标记被推翻（不再进联想注入，recall_entity 可见链）"})
+
+    if action == "archive":
+        result = ei.set_fragment_status(memory_id, "archived", note=note)
+        return _j(result if result.get("ok") else {**result, "note": "归档失败"})
+
+    # restore
+    result = ei.set_fragment_status(memory_id, "active", note=note)
+    if result.get("ok"):
+        return _j({**result, "note": "已恢复 active（重新参与联想；衰减门仍按时间生效）"})
+    return _j(result)
+
+
+registry.register(
+    name="update_memory_cognition",
+    toolset="actions",
+    schema={
+        "name": "update_memory_cognition",
+        "description": (
+            "维护碎片记忆的认知生命周期。什么时候用：\n"
+            "- 结论再次被验证 → verify（旧碎片验证计数+1）\n"
+            "- 结论被事实推翻 → falsify（两次进入 challenged 待决断）或直接 supersede\n"
+            "- 新结论替代旧结论 → supersede（写新碎片+旧碎片标记已推翻，保留追溯链，不删除）\n"
+            "- 确认某碎片彻底没用 → archive；归档错了 → restore\n"
+            "superseded/archived 的碎片不再进入联想注入，但 recall_entity 主动查询可见并带链注记。"
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "description": "verify=验证 | falsify=证伪 | supersede=新结论推翻旧结论 | archive=归档 | restore=恢复",
+                    "enum": ["verify", "falsify", "supersede", "archive", "restore"],
+                },
+                "memory_id": {"type": "string", "description": "目标碎片 id（recall_entity / sense_entity 返回里有）"},
+                "note": {"type": "string", "description": "一句话理由（如'清仓事实推翻了止损结论'），落 status_note"},
+                "new_text": {"type": "string", "description": "supersede 专用：新结论内容"},
+                "new_type": {"type": "string", "description": "supersede 新碎片类型，默认 lesson", "enum": ["lesson", "insight", "rule"]},
+                "entities": {"type": "array", "items": {"type": "string"}, "description": "supersede 新碎片挂载实体，默认继承旧碎片"},
+                "scope": {"type": "string", "description": "archive 批量模式：decayed=归档全部低于衰减阈值的碎片（dream 认知体检用）", "enum": ["decayed"]},
+            },
+            "required": ["action"],
+        },
+    },
+    handler=_handle_update_memory_cognition,
+    check_fn=lambda: True,
+    emoji="🧠",
 )
 
 

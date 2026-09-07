@@ -91,6 +91,7 @@ extra:
 - **持仓股交易发生时** → 立刻 update profile 反映新状态
 - **关键论断调整时** → 立刻 update
 - **认识一个新人/新实体** → 第一次互动就建 profile
+- **决策已推翻时** → 先 `update_memory_cognition(action=supersede)` 在**碎片层**留推翻链（旧结论标 superseded + 指向新结论），**再**重写 profile——profile 只呈现当前结论，推翻史活在碎片链里可溯源
 
 不要让 profile **陈旧地存在**。如果旧 profile 已过时（持仓已清、决策已推翻），编辑或重写，不要保留过期信息。
 
@@ -104,6 +105,8 @@ extra:
 | `merge_entities` | 合并别名 |
 | `prune_fragments_for_entity` | profile 写完后清理碎片 |
 | `add_lesson` | 写完后顺便总结一条 takeaway → 影响判断 |
+| `update_memory_cognition` | verify / falsify / supersede / archive / restore——结论级认知变更，决策推翻时先留链再重写 profile |
+| `sense_cognition_backlog` | 看 challenged 待决断 / 待归档 / 最近推翻链三张清单 |
 
 ## 七、记忆治理的边界
 

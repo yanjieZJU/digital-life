@@ -12,9 +12,26 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+from domain.memory.memory.consciousness.cognition import (
+    ARCHIVE_FRESHNESS_FLOOR,
+    CHALLENGED_AUTHORITY_FACTOR,
+    COG_ACTIVE,
+    COG_ARCHIVED,
+    COG_AUTO_SUPERSEDE,
+    COG_CHALLENGED,
+    COG_DUP_JACCARD,
+    COG_SUPERSEDED,
+    FALSIFY_TO_CHALLENGED,
+    bigram_jaccard,
+    fragment_age_days,
+    fragment_freshness,
+    is_valid_cog_key,
+    normalize_cog_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -73,6 +90,31 @@ def _now_iso() -> str:
     return datetime.now(_LOCAL_TZ).isoformat()
 
 
+def _apply_to_memory_copies(
+    data: dict[str, Any],
+    memory_id: str,
+    mutator: Callable[[dict[str, Any]], None],
+) -> int:
+    """对同一 memory_id 的【所有】实体副本应用 mutator，返回命中副本数。
+
+    认知字段（status/cog_key/challenge_count 等）按 memory_id 全局演进：
+    同一 memory_id 挂 N 个实体 = 同一条逻辑记忆，副本是"实体↔记忆链接"
+    不是独立记忆——分叉演进会让 query_entities 的全局去重（只返回先扫到
+    的那份副本）读到哪个状态取决于 dict 遍历顺序，是不确定性行为。
+
+    只改内存 dict，不落盘——调用方负责单次 load → 变更 → save。
+    """
+    if not memory_id:
+        return 0
+    hits = 0
+    for entity in data.get("entities", {}).values():
+        for mem in entity.get("memories", []):
+            if mem.get("memory_id") == memory_id:
+                mutator(mem)
+                hits += 1
+    return hits
+
+
 def update_entity_index(
     entities: list[str],
     *,
@@ -82,7 +124,8 @@ def update_entity_index(
     linked_entities: list[str] | None = None,
     tag: str = "",
     replace_existing: bool = False,
-) -> None:
+    cog_key: str = "",
+) -> dict[str, Any]:
     """Associate a memory with one or more entities in the index.
 
     Creates new entity entries as needed.
@@ -90,12 +133,55 @@ def update_entity_index(
     When replace_existing=True, removes old entries of the same memory_type
     for each entity before adding the new one. Used for state-report
     consciousness entries that should only have one current snapshot.
+
+    cog_key（可选，"subject:predicate" 结构化认知主键）触发写时查重
+    （域=同 memory_type + active + 同 key）：
+      - snippet bigram jaccard ≥ COG_DUP_JACCARD → 同一结论重复提出：
+        不写新碎片，旧碎片全副本 verification_count +1，返回 skip_bumped。
+      - jaccard < 阈值 → 结论变了：写新碎片并自动 supersede 旧碎片
+        （旧→superseded+superseded_by，新→derived_from），返回 superseded。
+        COG_AUTO_SUPERSEDE=False 时只在新碎片记 conflict_with 不执行翻转。
+    非法格式（缺分隔符/单侧为空）按防御性处理：丢弃 cog_key 走普通写入
+    （格式校验的模型引导在工具层做）。
+
+    返回 {"action": "insert"|"skip_bumped"|"superseded", ...}；旧行为调用方
+    忽略返回值不受影响。
     """
     if not entities:
-        return
+        return {"action": "insert", "memory_id": memory_id, "hits": 0}
+
+    key = normalize_cog_key(cog_key) if cog_key else ""
+    if cog_key and not is_valid_cog_key(cog_key):
+        logger.warning("update_entity_index: 非法 cog_key %r 已丢弃（应为 subject:predicate）", cog_key[:40])
+        key = ""
 
     data = load_entity_index()
     entities_dict: dict[str, dict[str, Any]] = data.setdefault("entities", {})
+
+    # ── cog_key 写时查重（拷贝循环之前，全索引范围）────────────────────────
+    superseded_ids: list[str] = []
+    bump_ids: list[str] = []
+    if key:
+        same_key_actives = _find_active_by_cog_key(data, key, memory_type)
+        if same_key_actives:
+            latest = same_key_actives[0]  # _find_active_by_cog_key 已按时间降序
+            if bigram_jaccard(snippet, str(latest.get("snippet", ""))) >= COG_DUP_JACCARD:
+                bump_ids = [str(latest.get("memory_id", ""))]
+            else:
+                # 结论变了：同 key 的全部 active 旧碎片都应让位（正常只有
+                # 一条；多条是历史异常，一并翻转恢复不变量）
+                superseded_ids = [str(m.get("memory_id", "")) for m in same_key_actives]
+
+    if bump_ids:
+        # 同一结论重复提出 → 视为再次验证，不新增碎片
+        for old_id in bump_ids:
+            _apply_to_memory_copies(
+                data, old_id,
+                lambda m: m.__setitem__(
+                    "verification_count", int(m.get("verification_count", 0)) + 1),
+            )
+        save_entity_index(data)
+        return {"action": "skip_bumped", "memory_id": bump_ids[0], "hits": len(entities)}
 
     memory_entry: dict[str, Any] = {
         "memory_type": memory_type,
@@ -108,6 +194,13 @@ def update_entity_index(
     }
     if tag:
         memory_entry["tag"] = tag
+    if key:
+        memory_entry["cog_key"] = key
+    if superseded_ids:
+        if COG_AUTO_SUPERSEDE:
+            memory_entry["derived_from"] = list(superseded_ids)
+        else:
+            memory_entry["conflict_with"] = list(superseded_ids)
 
     for entity_name in entities:
         if not entity_name or not entity_name.strip():
@@ -132,7 +225,51 @@ def update_entity_index(
         if memory_id not in existing_ids:
             entity["memories"].append(dict(memory_entry))
 
+    # ── 自动 supersede：同 key 异值的旧碎片让位（按 memory_id 全副本同步）──
+    if superseded_ids and COG_AUTO_SUPERSEDE:
+        now_iso = _now_iso()
+        for old_id in superseded_ids:
+            def _mark_old(m: dict[str, Any], _old=old_id) -> None:
+                m["status"] = COG_SUPERSEDED
+                m["superseded_by"] = memory_id
+                m["superseded_at"] = now_iso
+            _apply_to_memory_copies(data, old_id, _mark_old)
+
     save_entity_index(data)
+    return {
+        "action": "superseded" if superseded_ids and COG_AUTO_SUPERSEDE else "insert",
+        "memory_id": memory_id,
+        "superseded": superseded_ids if COG_AUTO_SUPERSEDE else [],
+        "hits": len(entities),
+    }
+
+
+def _find_active_by_cog_key(
+    data: dict[str, Any], cog_key: str, memory_type: str,
+) -> list[dict[str, Any]]:
+    """全索引中同 memory_type + active + 同 cog_key 的碎片，按 timestamp 降序。
+
+    查重域限定同 memory_type：record_thought 对同一文本双写 consciousness
+    +insight 两条碎片且共用同一 cog_key——跨类型共存是合法形态，不互查。
+    返回的是索引内真实 dict 引用（供写路径直接变更）。
+    """
+    found: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for entity in data.get("entities", {}).values():
+        for mem in entity.get("memories", []):
+            mid = str(mem.get("memory_id", ""))
+            if mid in seen_ids:
+                continue
+            if str(mem.get("memory_type", "")) != memory_type:
+                continue
+            if str(mem.get("status") or "") not in ("", COG_ACTIVE):
+                continue
+            if str(mem.get("cog_key", "")) != cog_key:
+                continue
+            seen_ids.add(mid)
+            found.append(mem)
+    found.sort(key=lambda m: str(m.get("timestamp", "")), reverse=True)
+    return found
 
 
 def query_entities(entity_names: list[str]) -> list[dict[str, Any]]:
@@ -167,18 +304,24 @@ def _compute_authority(memory: dict[str, Any]) -> float:
     mtype = str(memory.get("memory_type", "")).lower()
     tag = str(memory.get("tag", "")).lower()
 
+    base = 0.4
     if mtype == "rule":
-        return _AUTHORITY_MAP["rule"]
-    if mtype == "lesson":
-        return _AUTHORITY_MAP["lesson"]
-    if mtype == "scratchpad":
-        return _AUTHORITY_MAP["scratchpad"]
-    if mtype == "consciousness":
+        base = _AUTHORITY_MAP["rule"]
+    elif mtype == "lesson":
+        base = _AUTHORITY_MAP["lesson"]
+    elif mtype == "scratchpad":
+        base = _AUTHORITY_MAP["scratchpad"]
+    elif mtype == "consciousness":
+        base = 0.3
         for low_tag in _LOW_AUTHORITY_TAGS:
             if low_tag in tag:
-                return 0.3
-        return _AUTHORITY_MAP["consciousness"]
-    return 0.4
+                break
+        else:
+            base = _AUTHORITY_MAP["consciousness"]
+    # 被证伪待决断的碎片降权（不除名——challenged 仍参与召回，等 dream 决断）
+    if str(memory.get("status") or "") == COG_CHALLENGED:
+        return base * CHALLENGED_AUTHORITY_FACTOR
+    return base
 
 
 def _compute_recency(timestamp: str | None) -> float:
@@ -213,6 +356,7 @@ def query_entities_ranked(
     current_context: str = "",
     exclude_ids: set[str] | None = None,
     limit: int = 3,
+    include_superseded: bool = False,
 ) -> list[dict[str, Any]]:
     """Multi-dimensional ranked query for entity memories.
 
@@ -245,6 +389,17 @@ def query_entities_ranked(
     for mem in results:
         mid = str(mem.get("memory_id", ""))
         if mid and mid in exclude:
+            continue
+
+        # 认知生命周期门（纯函数，绝不写盘——"召回不回写"由
+        # tests/test_memory_redundancy_cuts.py 字节级锁定）：
+        #   - 状态门：superseded/archived 出局（被推翻/已归档不进被动注入）；
+        #     include_superseded=True 放开（主动查询历史场景）
+        #   - 衰减门：freshness < 地板线出局（分层半衰期，rule/lesson 永不衰减），恒开
+        status = str(mem.get("status") or "") or COG_ACTIVE
+        if status in (COG_SUPERSEDED, COG_ARCHIVED) and not include_superseded:
+            continue
+        if fragment_freshness(mem) < ARCHIVE_FRESHNESS_FLOOR:
             continue
 
         score = (
@@ -457,22 +612,51 @@ def bump_verification_for_entities(entity_names: list[str], memory_type: str) ->
 
 
 def bump_verification(memory_id: str) -> None:
-    """Increment verification_count for a memory entry."""
+    """Increment verification_count for a memory entry.
+
+    按记忆惯例本应只 bump 第一份副本——现改走 _apply_to_memory_copies
+    同步全部副本（认知计数是记忆的属性，不是链接的属性；副本分叉
+    会让召回读到不确定的状态）。全仓此前无调用方，行为变更零风险。
+    """
     if not memory_id:
         return
     data = load_entity_index()
-    for entity_data in data.get("entities", {}).values():
-        for mem in entity_data.get("memories", []):
-            if mem.get("memory_id") == memory_id:
-                mem["verification_count"] = int(mem.get("verification_count", 0)) + 1
-                save_entity_index(data)
-                return
+    hits = _apply_to_memory_copies(
+        data, memory_id,
+        lambda m: m.__setitem__(
+            "verification_count", int(m.get("verification_count", 0)) + 1),
+    )
+    if hits:
+        save_entity_index(data)
 
 
 def get_entity_summary(entity_name: str) -> dict[str, Any] | None:
     """Get summary of an entity including its memories and metadata."""
     data = load_entity_index()
     return data.get("entities", {}).get(entity_name)
+
+
+def get_fragment_by_id(memory_id: str) -> dict[str, Any] | None:
+    """按 memory_id 全索引查找碎片（副本内容一致，取第一份）。
+
+    返回 {"fragment": {...}, "entities": [挂载实体名...]}；不存在返回 None。
+    update_memory_cognition 工具用它在 supersede 时继承旧碎片的
+    cog_key / linked_entities。
+    """
+    if not memory_id:
+        return None
+    data = load_entity_index()
+    fragment: dict[str, Any] | None = None
+    owners: list[str] = []
+    for name, entity in data.get("entities", {}).items():
+        for mem in entity.get("memories", []):
+            if mem.get("memory_id") == memory_id:
+                if fragment is None:
+                    fragment = mem
+                owners.append(name)
+    if fragment is None:
+        return None
+    return {"fragment": fragment, "entities": owners}
 
 
 def list_entity_names() -> list[str]:
@@ -724,6 +908,240 @@ def mark_entity_status(name: str, **flags: Any) -> None:
         logger.warning("mark_entity_status failed for '%s': %s", name[:20], exc)
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# 碎片认知生命周期（cognition）
+# ─────────────────────────────────────────────────────────────────────────
+# 写路径 API：全部经 _apply_to_memory_copies 按 memory_id 全副本同步，
+# 单次 load → 变更 → save。读路径门控见 query_entities_ranked。
+
+_COG_VALID_STATUSES = frozenset({COG_ACTIVE, COG_CHALLENGED, COG_SUPERSEDED, COG_ARCHIVED})
+
+
+def apply_cognition_signal(memory_id: str, signal: str, note: str = "") -> dict[str, Any]:
+    """对碎片施加 verify / falsify 信号（上游 verified/falsified delta 本地化）。
+
+    - verified：verification_count +1（打分公式的 verification_bonus×0.15
+      天然承担"反复验证提升权威"，不另存浮点 authority）；若当前
+      challenged → 恢复 active（复证可撤销质疑，challenge_count 保留作历史）。
+    - falsified：challenge_count +1；当 challenge_count ≥ FALSIFY_TO_CHALLENGED
+      且当前 active → challenged（被证伪待决断，召回中降权但可见，等 dream 决断）。
+
+    note（一句话理由）落 status_note。返回 {"ok", "hits", "status"}；
+    hits=0 表示 memory_id 不存在（ok=False）。
+    """
+    if signal not in ("verified", "falsified"):
+        return {"ok": False, "reason": f"未知信号 {signal!r}（应为 verified/falsified）"}
+    data = load_entity_index()
+
+    final_status: dict[str, str] = {}
+
+    def _mutate(mem: dict[str, Any]) -> None:
+        if signal == "verified":
+            mem["verification_count"] = int(mem.get("verification_count", 0)) + 1
+            if str(mem.get("status") or "") == COG_CHALLENGED:
+                mem["status"] = COG_ACTIVE
+        else:
+            cc = int(mem.get("challenge_count", 0)) + 1
+            mem["challenge_count"] = cc
+            if cc >= FALSIFY_TO_CHALLENGED and str(mem.get("status") or "") in ("", COG_ACTIVE):
+                mem["status"] = COG_CHALLENGED
+        if note:
+            mem["status_note"] = note
+        final_status["value"] = str(mem.get("status") or "") or COG_ACTIVE
+
+    hits = _apply_to_memory_copies(data, memory_id, _mutate)
+    if not hits:
+        return {"ok": False, "hits": 0, "reason": f"memory_id {memory_id!r} 不存在"}
+    save_entity_index(data)
+    return {"ok": True, "hits": hits, "signal": signal,
+            "status": final_status.get("value", COG_ACTIVE)}
+
+
+def apply_supersede(old_memory_id: str, new_memory_id: str, *, note: str = "") -> dict[str, Any]:
+    """新结论推翻旧结论：旧→superseded+superseded_by，新→derived_from 追加。
+
+    幂等（旧已是 superseded 重复执行结果一致）；自环拒绝（old==new）。
+    旧碎片从 ranked 召回出局（状态门），但 recall_entity 主动查询可见
+    并带链注记——"知道自己改过主意"的认知价值放在主动深挖路径。
+    """
+    if not old_memory_id or not new_memory_id:
+        return {"ok": False, "reason": "old/new memory_id 均必填"}
+    if old_memory_id == new_memory_id:
+        return {"ok": False, "reason": "不能 supersede 自身"}
+    data = load_entity_index()
+    now_iso = _now_iso()
+
+    def _mark_old(mem: dict[str, Any]) -> None:
+        mem["status"] = COG_SUPERSEDED
+        mem["superseded_by"] = new_memory_id
+        mem["superseded_at"] = now_iso
+        if note:
+            mem["status_note"] = note
+
+    def _mark_new(mem: dict[str, Any]) -> None:
+        derived = list(mem.get("derived_from", []))
+        if old_memory_id not in derived:
+            derived.append(old_memory_id)
+        mem["derived_from"] = derived
+
+    old_hits = _apply_to_memory_copies(data, old_memory_id, _mark_old)
+    new_hits = _apply_to_memory_copies(data, new_memory_id, _mark_new)
+    if not old_hits and not new_hits:
+        return {"ok": False, "reason": f"两个 memory_id 都不存在: {old_memory_id!r}/{new_memory_id!r}"}
+    save_entity_index(data)
+    return {"ok": True, "old_hits": old_hits, "new_hits": new_hits,
+            "old": old_memory_id, "new": new_memory_id}
+
+
+def set_fragment_status(memory_id: str, status: str, *, note: str = "") -> dict[str, Any]:
+    """显式设置碎片状态（archive / restore 的通用底座）。
+
+    restore 用 status="active"：恢复参与召回；superseded_by 等链路注记
+    保留作历史（门控只看 status）。note 落 status_note。
+    """
+    if status not in _COG_VALID_STATUSES:
+        return {"ok": False, "reason": f"未知状态 {status!r}（应为 {'/'.join(sorted(_COG_VALID_STATUSES))}）"}
+    data = load_entity_index()
+
+    def _mutate(mem: dict[str, Any]) -> None:
+        mem["status"] = status
+        if note:
+            mem["status_note"] = note
+
+    hits = _apply_to_memory_copies(data, memory_id, _mutate)
+    if not hits:
+        return {"ok": False, "hits": 0, "reason": f"memory_id {memory_id!r} 不存在"}
+    save_entity_index(data)
+    return {"ok": True, "hits": hits, "status": status}
+
+
+def archive_decayed_fragments(*, max_count: int = 200) -> dict[str, Any]:
+    """dream 认知体检专用批量归档：freshness < 地板线且 active → archived。
+
+    归档不删除（可 restore）；幂等（已 archived 的不再计）。这是衰减的
+    唯一写回路径——读时门控是纯函数不落盘，本函数把"事实上已被时间
+    淘汰"落成可见状态位，让 backlog 报告可审计。
+
+    max_count 防单次写盘过大（按 timestamp 从旧到新归档）。
+    """
+    data = load_entity_index()
+    candidates: list[tuple[str, dict[str, Any]]] = []  # (timestamp, mem)
+    for entity in data.get("entities", {}).values():
+        for mem in entity.get("memories", []):
+            if str(mem.get("status") or "") not in ("", COG_ACTIVE):
+                continue
+            if fragment_freshness(mem) < ARCHIVE_FRESHNESS_FLOOR:
+                candidates.append((str(mem.get("timestamp", "")), mem))
+    candidates.sort(key=lambda x: x[0])  # 旧的先归档
+
+    now_iso = _now_iso()
+    by_type: dict[str, int] = {}
+    sample_ids: list[str] = []
+    archived = 0
+    for _, mem in candidates:
+        if archived >= max_count:
+            break
+        mtype = str(mem.get("memory_type", "?"))
+        mem["status"] = COG_ARCHIVED
+        mem["archived_at"] = now_iso
+        by_type[mtype] = by_type.get(mtype, 0) + 1
+        if len(sample_ids) < 10:
+            sample_ids.append(str(mem.get("memory_id", "")))
+        archived += 1
+
+    if archived:
+        save_entity_index(data)
+    return {"archived": archived, "by_type": by_type, "sample_ids": sample_ids}
+
+
+def get_supersede_chain(memory_id: str) -> list[dict[str, Any]]:
+    """沿 superseded_by 向新追链（旧→新），防环。
+
+    返回 [{memory_id, memory_type, snippet, status, superseded_by, timestamp}]，
+    首元素是查询的碎片自身。供 recall_entity / cognition_backlog 展示
+    "这个结论被什么推翻了、推翻后又经历了什么"。
+    """
+    data = load_entity_index()
+    by_id: dict[str, dict[str, Any]] = {}
+    for entity in data.get("entities", {}).values():
+        for mem in entity.get("memories", []):
+            by_id.setdefault(str(mem.get("memory_id", "")), mem)
+
+    chain: list[dict[str, Any]] = []
+    visited: set[str] = set()
+    current = memory_id
+    while current and current in by_id and current not in visited:
+        visited.add(current)
+        mem = by_id[current]
+        chain.append({
+            "memory_id": current,
+            "memory_type": str(mem.get("memory_type", "")),
+            "snippet": str(mem.get("snippet", ""))[:80],
+            "status": str(mem.get("status") or "") or COG_ACTIVE,
+            "superseded_by": str(mem.get("superseded_by", "") or ""),
+            "timestamp": str(mem.get("timestamp", "")),
+        })
+        current = str(mem.get("superseded_by", "") or "")
+    return chain
+
+
+def cognition_backlog(*, list_cap: int = 20) -> dict[str, Any]:
+    """认知积压三张清单（纯读，sense_cognition_backlog 工具与体检面板共用）。
+
+    - challenged：被证伪待 dream 决断（supersede 或 verify），不带过夜
+    - to_archive：freshness 已低于地板线、尚未写回 archived 的 active 碎片
+    - recent_supersede：最近的推翻链头（按 superseded_at 降序）
+
+    列表按 list_cap 截断，counts 是全量计数。
+    """
+    data = load_entity_index()
+    challenged: list[dict[str, Any]] = []
+    to_archive: list[dict[str, Any]] = []
+    superseded: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for entity_name, entity in data.get("entities", {}).items():
+        for mem in entity.get("memories", []):
+            mid = str(mem.get("memory_id", ""))
+            if not mid or mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            status = str(mem.get("status") or "") or COG_ACTIVE
+            base = {
+                "memory_id": mid,
+                "entity": entity_name,
+                "memory_type": str(mem.get("memory_type", "")),
+                "snippet": str(mem.get("snippet", ""))[:80],
+                "timestamp": str(mem.get("timestamp", "")),
+            }
+            if status == COG_CHALLENGED:
+                item = dict(base, challenge_count=int(mem.get("challenge_count", 0)),
+                            status_note=str(mem.get("status_note", "")))
+                challenged.append(item)
+            elif status == COG_SUPERSEDED:
+                superseded.append(dict(
+                    base,
+                    superseded_by=str(mem.get("superseded_by", "") or ""),
+                    superseded_at=str(mem.get("superseded_at", "") or ""),
+                ))
+            elif status == COG_ACTIVE and fragment_freshness(mem) < ARCHIVE_FRESHNESS_FLOOR:
+                to_archive.append(dict(
+                    base,
+                    age_days=round(fragment_age_days(mem) or 0.0, 1),
+                    freshness=round(fragment_freshness(mem), 4),
+                ))
+
+    superseded.sort(key=lambda x: x.get("superseded_at", ""), reverse=True)
+    return {
+        "challenged_count": len(challenged),
+        "to_archive_count": len(to_archive),
+        "superseded_count": len(superseded),
+        "challenged": challenged[:list_cap],
+        "to_archive": to_archive[:list_cap],
+        "recent_supersede": superseded[:list_cap],
+    }
+
+
 __all__ = [
     "load_entity_index",
     "save_entity_index",
@@ -736,6 +1154,7 @@ __all__ = [
     "bump_verification",
     "bump_verification_for_entities",
     "get_entity_summary",
+    "get_fragment_by_id",
     # Concept memory API:
     "set_entity_profile",
     "get_entity_profile",
@@ -745,4 +1164,11 @@ __all__ = [
     # Auto-sync API:
     "sync_entity_from_source",
     "mark_entity_status",
+    # 碎片认知生命周期 API:
+    "apply_cognition_signal",
+    "apply_supersede",
+    "set_fragment_status",
+    "archive_decayed_fragments",
+    "get_supersede_chain",
+    "cognition_backlog",
 ]
